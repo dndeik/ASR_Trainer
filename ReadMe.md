@@ -36,7 +36,7 @@ Install `requirements.txt`
 pip3 install -r requirements.txt
 ```
 ### Additional
-If you want to use `ClearML', install its package, configure credentials for it and set it in `cfg_train.toml`
+If you want to use `ClearML`, install its package, configure credentials for it and set it in `cfg_train.toml`
 ```toml
 [logger]
 log_to_clearml = true
