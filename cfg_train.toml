@@ -1,0 +1,67 @@
+[network_config]
+
+
+[GPUs]
+devices = "0"   # number of available gpus
+
+[optimizer]
+lr = 0.0001
+
+[model]
+inter_d_model = 768
+layer_num = 12
+n_heads = 12
+chunk_size = 100
+time_factor = 4
+n_mel = 60
+
+[tokenizer]
+tokenizer_path = "models/ru_tokenizer/tokenizer_spe_bpe_cp"
+
+[listener]
+listener_sr = 16000
+
+[FFT]
+n_fft = 320
+hop_length = 160
+win_length = 320
+
+[train_dataset]
+train_manifest = "/opt/datasets/ASR_data/CAPITALIZED_TRAIN_FINAL.jsonl" # Put the path to your train dataset
+file_num = -1
+max_len = 13
+min_len = 3
+
+[train_dataloader]
+batch_size = 10
+num_workers = 6
+drop_last = true
+pin_memory = true
+
+[validation_dataset]
+train_manifest = "/opt/datasets/ASR_data/CAPITALIZED_TEST_FINAL.jsonl" # Put the path to your test dataset
+file_num = -1
+max_len = 18
+min_len = 4
+
+[validation_dataloader]
+batch_size = 36
+num_workers = 12
+pin_memory = true
+
+[logger]
+log_to_clearml = false
+
+[trainer]
+epochs = 15
+save_checkpoint_interval = 1
+train_with_amp = true
+grad_accum = 8
+validation_interval = 1
+clip_grad_norm_value = 3.0
+exp_path = "experiments/gqa_with_mamba"
+resume = false
+resume_checkpoint_path = ''
+resume_datetime = '2025-11-19-23h43m'
+resume_step = 0
+

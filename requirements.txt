@@ -1,0 +1,8 @@
+tqdm==4.67.1
+toml==0.10.2
+sentencepiece==0.2.1
+pandas==2.3.3
+tensorboard==2.20.0
+einops==0.8.1
+werpy==3.1.0
+librosa==0.11.0
