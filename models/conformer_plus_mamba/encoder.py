@@ -75,7 +75,7 @@ class DropPath(nn.Module):
 
 
 class BaseEncoderBlock(nn.Module):
-    def __init__(self, type: str, d_model, n_heads, chunk_size, left_context, dropout=0.):
+    def __init__(self, type: str, d_model, n_heads, n_groups, chunk_size, left_context, dropout=0.):
         super().__init__()
         self.chunk_size = chunk_size
         self.left_context = left_context
@@ -85,11 +85,7 @@ class BaseEncoderBlock(nn.Module):
 
         self.pre_attn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
         if self.type == 'attn':
-            # self.block = nn.MultiheadAttention(d_model,
-            #                                    num_heads=n_heads,
-            #                                    dropout=dropout,
-            #                                    batch_first=True)
-            self.block = GQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_heads // 2, max_position=chunk_size+left_context, dropout=dropout,)
+            self.block = GQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_groups, max_position=chunk_size+left_context, bias=False, dropout=dropout,)
         elif self.type == 'mamba':
             self.block = Mamba2(Mamba2Config(d_model=d_model, chunk_size=chunk_size))
 
@@ -204,9 +200,8 @@ class GQASelfAttention(nn.Module):
         return attn_output
 
 
-
 class GQASelfAttentionRelPos(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_groups, max_position=128, bias=True, dropout=0.0):
+    def __init__(self, embed_dim, num_heads, num_groups, max_position=128, bias=False, dropout=0.0):
         super().__init__()
         assert embed_dim % num_heads == 0
         assert embed_dim % num_groups == 0
@@ -281,18 +276,19 @@ class GQASelfAttentionRelPos(nn.Module):
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, inter_d_model, chunk_size, context_chunk_number, n_heads=4, layer_num=1, dropout=0.1):
+    def __init__(self, inter_d_model, chunk_size, context_chunk_number, n_heads, n_groups, layer_num=1, mamba_every_n_block=3, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
         self.dropout = dropout
         self.chunk_size = chunk_size
         self.left_context = context_chunk_number * chunk_size
 
+        assert mamba_every_n_block > 0, '"mamba_every_n_block" should be more then 0'
+
         self.blocks = nn.ModuleList()
         for i in range(layer_num):
-            block_type = "mamba" if (i+1) % 3 == 0 else "attn"
-            # block_type = "attn"
-            self.blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, self.chunk_size, self.left_context, dropout))
+            block_type = "mamba" if (i+1) % mamba_every_n_block == 0 else "attn"
+            self.blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context, dropout))
 
     def _cut_masks_with_len_cycle(self, mask, lens):
         B, L = lens.shape

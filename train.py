@@ -66,9 +66,12 @@ def run(rank, config, args):
                         n_mel=config['model']['n_mel'],
                         time_factor=config['model']['time_factor'],
                         chunk_size=config['model']['chunk_size'],
+                        context_chunk_number=config['model']['context_chunk_number'],
                         freq_dim=config['FFT']['hop_length']+1,
                         n_heads=config['model']['n_heads'],
+                        n_groups=config['model']['n_groups'],
                         layer_num=config['model']['layer_num'],
+                        mamba_every_n_block=config['model']['mamba_every_n_block'],
                         dropout=0.1)
     
     # ckpt = torch.load("experiments/gqa_with_mamba_FIXED_2025-11-19-14h35m/checkpoints/model_0001.tar", weights_only=False)

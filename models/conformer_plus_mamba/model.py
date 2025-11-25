@@ -118,14 +118,14 @@ class JointNet(nn.Module):
 
 
 class ConformerHybrid(nn.Module):
-    def __init__(self, num_vocab, inter_d_model, n_mel, time_factor, chunk_size, freq_dim, n_heads=4, layer_num=8,
-                 dropout=0.1):
+    def __init__(self, num_vocab, inter_d_model, freq_dim, n_mel, time_factor, n_heads, n_groups, chunk_size, context_chunk_number=1, layer_num=8,
+                 mamba_every_n_block=3, dropout=0.1):
         super().__init__()
         # Encoder part
         chunk_size = chunk_size // time_factor
         self.trainable_mel = self._get_trainable_mel(freq_dim, n_mel)
         self.in_proj = SpeechEncoder(n_mel, inter_d_model, k_size=time_factor*2+1, stride=time_factor)
-        self.encoder = AudioEncoder(inter_d_model, chunk_size, 1, n_heads, layer_num, dropout)
+        self.encoder = AudioEncoder(inter_d_model, chunk_size, context_chunk_number, n_heads, n_groups, layer_num, mamba_every_n_block, dropout)
         self.post_norm = nn.LayerNorm(inter_d_model, eps=GLOBAL_EPS)
 
         # CTC head
