@@ -11,7 +11,7 @@ from utils.decoding import ctc_greedy_decode_batch
 GLOBAL_EPS = 1e-3
 
 
-class SpeechEncoder(nn.Module):
+class DownsampleConv(nn.Module):
     def __init__(self, in_channel, out_channel, k_size=3, stride=1):
         super().__init__()
 
@@ -36,7 +36,7 @@ class ConformerCTC(nn.Module):
         super().__init__()
         chunk_size = chunk_size // time_factor
         self.trainable_mel = self._get_trainable_mel(freq_dim, n_mel)
-        self.in_proj = SpeechEncoder(n_mel, inter_d_model, k_size=time_factor*2+1, stride=time_factor)
+        self.in_proj = DownsampleConv(n_mel, inter_d_model, k_size=time_factor * 2 + 1, stride=time_factor)
         self.encoder = AudioEncoder(inter_d_model, chunk_size, 1, n_heads, layer_num, dropout)
 
         self.post_norm = nn.LayerNorm(inter_d_model, eps=GLOBAL_EPS)
@@ -135,7 +135,7 @@ class ConformerHybrid(nn.Module):
         # Encoder part
         chunk_size = chunk_size // time_factor
         self.trainable_mel = self._get_trainable_mel(freq_dim, n_mel)
-        self.in_proj = SpeechEncoder(n_mel, inter_d_model, k_size=time_factor*2+1, stride=time_factor)
+        self.in_proj = DownsampleConv(n_mel, inter_d_model, k_size=time_factor * 2 + 1, stride=time_factor)
         self.encoder = AudioEncoder(inter_d_model, chunk_size, context_chunk_number, n_heads, n_groups, layer_num, mamba_every_n_block, dropout)
         self.post_norm = nn.LayerNorm(inter_d_model, eps=GLOBAL_EPS)
 
