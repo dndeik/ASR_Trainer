@@ -200,6 +200,7 @@ class GQASelfAttention(nn.Module):
         return attn_output
 
 
+
 class GQASelfAttentionRelPos(nn.Module):
     def __init__(self, embed_dim, num_heads, num_groups, max_position=128, bias=False, dropout=0.0):
         super().__init__()
@@ -294,12 +295,11 @@ class AudioEncoder(nn.Module):
         B, L = lens.shape
         masks = []
         for i in range(B):
-            cur_masks = torch.full_like(mask, fill_value=-1e9, device=mask.device)
+            cur_masks = torch.full_like(mask, fill_value=-5e4, device=mask.device)
             cur_masks[:lens[i] + self.left_context, :lens[i] + self.left_context] = mask[
                 :lens[i] + self.left_context, :lens[i] + self.left_context]
             masks.append(cur_masks)
         masks = torch.stack(masks)
-        masks = torch.repeat_interleave(masks, self.n_heads, 0)
         return masks
 
     def _cut_masks_with_len_vector(self, mask, lens):
@@ -329,13 +329,16 @@ class AudioEncoder(nn.Module):
         # Формируем итоговую маску с подблоками из базовой маски
         batch_masks = torch.where(valid_mask, mask_expanded, batch_masks)
 
-        masks = torch.repeat_interleave(batch_masks, self.n_heads, 0)
-        return masks
+        return batch_masks
 
-    def forward(self, x, audio_len):
+    def forward(self, x, audio_len=None):
         # GET MASK
         mask = get_mask_vector(self.chunk_size, x.shape[1] + self.left_context, self.left_context, device=x.device)
-        masks = self._cut_masks_with_len_vector(mask, audio_len)
+        if audio_len is not None:
+            masks = self._cut_masks_with_len_vector(mask, audio_len)
+        else:
+            masks = mask.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, L, L)
+        masks = torch.repeat_interleave(masks, self.n_heads, 0)
 
         for module in self.blocks:
             x = module(x, masks)

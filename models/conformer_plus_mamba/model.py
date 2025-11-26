@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torchaudio
 
 from models.conformer_plus_mamba.encoder import AudioEncoder
+from utils.decoding import ctc_greedy_decode_batch
 
 # from encoder import AudioEncoder
 
@@ -78,6 +79,11 @@ class Decoder(nn.Module):
         packed_seq, _ = self.predictor(packed_seq)
         out, _ = nn.utils.rnn.pad_packed_sequence(packed_seq, batch_first=True)
         return out
+    
+    def infer(self, y, hidden=None):
+        emb = self.embedding(y)
+        out, hidden = self.predictor(emb, hidden)
+        return out, hidden
 
 class CTCDecoder(nn.Module):
     def __init__(self, embed_dim, hidden_dim, dropout=0.1):
@@ -90,6 +96,11 @@ class CTCDecoder(nn.Module):
         packed_seq = nn.utils.rnn.pack_padded_sequence(x, x_lengths, batch_first=True, enforce_sorted=False)
         packed_seq, _ = self.predictor(packed_seq)
         out, _ = nn.utils.rnn.pad_packed_sequence(packed_seq, batch_first=True)
+        out = self.dropout(out)
+        return out
+    
+    def infer(self, x):
+        out, _ = self.predictor(x)
         out = self.dropout(out)
         return out
 
@@ -167,6 +178,66 @@ class ConformerHybrid(nn.Module):
         rnnt_logits = self.rnnt_classifier(enc_out, dec_out)
 
         return ctc_logits, rnnt_logits
+    
+    def infer_ctc(self, x, audio_len=None, blank_token_id=1024):
+        # [B, C, T, F]
+        x = torch.sqrt(x[:, 0, ...] ** 2 + x[:, 1, ...] ** 2)  # mag [B, T, F]
+        x = self.trainable_mel(x)
+        x = self.in_proj(x)
+        x = self.encoder(x, audio_len)
+        enc_out = self.post_norm(x)
+
+        # CTC head
+        ctc_logits = self.ctc_decoder.infer(enc_out)
+        ctc_logits = self.post_ctc_dec_norm(ctc_logits)
+        ctc_logits = self.ctc_classifier(ctc_logits)
+
+        out = ctc_greedy_decode_batch(ctc_logits, blank_token_id)
+
+        return out
+
+    def infer_rnnt(self, x, audio_len=None, blank_token_id=1024):
+        # [B, C, T, F]
+        assert x.shape[0] == 1, "Now only single file supported"
+
+        x = torch.sqrt(x[:, 0, ...] ** 2 + x[:, 1, ...] ** 2)  # mag [B, T, F]
+        x = self.trainable_mel(x)
+        x = self.in_proj(x)
+        x = self.encoder(x, audio_len)
+        enc_out = self.post_norm(x)
+
+        # RNNT greedy decoding
+        dec_out, hidden = self._run_decoder(torch.tensor(blank_token_id))
+        ans = []
+        max_gen_tokens = 10 # Redundant in most cases
+        for t in range(enc_out.shape[1]):
+            enc_out_t = enc_out[:, t: t + 1, :]
+            
+            step = 0
+            while step < max_gen_tokens:
+                step += 1
+                token = self._run_joiner(enc_out_t, dec_out)
+
+                if token.item() != blank_token_id:
+                    ans.append(token.item())
+                    dec_out, hidden = self._run_decoder(token, hidden)
+                    
+                else:
+                    break
+
+        return ans
+    
+    def _run_decoder(self, token, hidden=None):
+        token = token.unsqueeze(0).unsqueeze(0)
+        dec_out, hidden = self.rnnt_decoder.infer(token, hidden)
+        dec_out = self.post_rnnt_dec_norm(dec_out)
+
+        return dec_out, hidden
+    
+    def _run_joiner(self, enc_out, dec_out):
+        out = self.rnnt_classifier(enc_out, dec_out)
+        out = torch.argmax(torch.squeeze(out))
+        return out
 
 
 def count_parameters(model):
