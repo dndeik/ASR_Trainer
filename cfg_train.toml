@@ -14,7 +14,7 @@ n_heads = 12
 n_groups = 6
 chunk_size = 100
 context_chunk_number = 1
-mamba_every_n_block = 3
+mamba_every_n_block = 3 # if you don't want to use mamba, set -1
 time_factor = 4
 n_mel = 60
 

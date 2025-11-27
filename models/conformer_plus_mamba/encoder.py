@@ -284,11 +284,14 @@ class AudioEncoder(nn.Module):
         self.chunk_size = chunk_size
         self.left_context = context_chunk_number * chunk_size
 
-        assert mamba_every_n_block > 0, '"mamba_every_n_block" should be more then 0'
+        assert mamba_every_n_block == 0, "'mamba_every_n_block' can't be zero"
+        if mamba_every_n_block < 0:
+            print("'mamba_every_n_block' is less then zero, only GQA block will be used")
 
+        use_mamba = mamba_every_n_block > 0  # if "mamba_every_n_block" < 0 we use only GQA
         self.blocks = nn.ModuleList()
         for i in range(layer_num):
-            block_type = "mamba" if (i+1) % mamba_every_n_block == 0 else "attn"
+            block_type = "mamba" if (i+1) % mamba_every_n_block == 0 and use_mamba else "attn"
             self.blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context, dropout))
 
     def _cut_masks_with_len_cycle(self, mask, lens):
