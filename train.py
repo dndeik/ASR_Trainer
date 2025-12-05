@@ -1,5 +1,4 @@
 import os
-
 import json
 import toml
 import torch
@@ -11,7 +10,8 @@ import sentencepiece as spm
 
 from trainer import Trainer
 from models.conformer_plus_mamba.model import ConformerHybrid, count_parameters
-from datasets import MyDataset, BLANK_TOKEN_ID, custom_collate_fn
+from datasets import MyDataset, BucketingSampler, custom_collate_fn
+
 
 # seed = 4956
 # random.seed(seed)
@@ -29,51 +29,44 @@ def run(rank, config, args):
     args.rank = rank
     args.device = torch.device(rank)
 
-    tokenizer = spm.SentencePieceProcessor(model_file=os.path.join(config['tokenizer']['tokenizer_path'], "tokenizer.model"))
+    tokenizer = spm.SentencePieceProcessor(
+        model_file=os.path.join(config['tokenizer']['tokenizer_path'], "tokenizer.model"))
 
-    if args.world_size > 1:
+    multi_gpu = args.world_size > 1
+    if multi_gpu:
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12354'
         dist.init_process_group("gloo", rank=rank, init_method="env://?use_libuv=False", world_size=args.world_size)
         torch.cuda.set_device(rank)
         dist.barrier()
 
-        train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], **config['FFT'])
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, sampler=train_sampler,
-                                                       **config['train_dataloader'], shuffle=False,
-                                                       collate_fn=custom_collate_fn)
+    train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], **config['FFT'])
+    train_sampler = BucketingSampler(train_dataset.get_audio_lens(), config["train_dataloader"]["batch_size"])
+    train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_sampler=train_sampler,
+                                                   pin_memory=config['train_dataloader']['pin_memory'],
+                                                   num_workers=config['train_dataloader']['num_workers'],
+                                                   shuffle=False,
+                                                   collate_fn=custom_collate_fn)
 
-        validation_dataset = MyDataset(tokenizer=tokenizer, **config['validation_dataset'], **config['FFT'])
-        validation_sampler = torch.utils.data.distributed.DistributedSampler(validation_dataset)
-        validation_dataloader = torch.utils.data.DataLoader(dataset=validation_dataset, sampler=validation_sampler,
-                                                            **config['validation_dataloader'], shuffle=False,
-                                                            collate_fn=custom_collate_fn)
-    else:
-        train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], **config['FFT'])
-        train_sampler = None
-        train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, **config['train_dataloader'],
-                                                       shuffle=True,
-                                                       collate_fn=custom_collate_fn)
+    validation_dataset = MyDataset(tokenizer=tokenizer, **config['validation_dataset'], **config['FFT'])
+    validation_sampler = torch.utils.data.distributed.DistributedSampler(validation_dataset) if multi_gpu else None
+    validation_dataloader = torch.utils.data.DataLoader(dataset=validation_dataset, sampler=validation_sampler,
+                                                        **config['validation_dataloader'], shuffle=False,
+                                                        collate_fn=custom_collate_fn)
 
-        validation_dataset = MyDataset(tokenizer=tokenizer, **config['validation_dataset'], **config['FFT'])
-        validation_dataloader = torch.utils.data.DataLoader(dataset=validation_dataset,
-                                                            **config['validation_dataloader'], shuffle=False,
-                                                            collate_fn=custom_collate_fn)
+    model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1,
+                            inter_d_model=config['model']['inter_d_model'],
+                            n_mel=config['model']['n_mel'],
+                            time_factor=config['model']['time_factor'],
+                            chunk_size=config['model']['chunk_size'],
+                            context_chunk_number=config['model']['context_chunk_number'],
+                            freq_dim=config['FFT']['hop_length'] + 1,
+                            n_heads=config['model']['n_heads'],
+                            n_groups=config['model']['n_groups'],
+                            layer_num=config['model']['layer_num'],
+                            mamba_every_n_block=config['model']['mamba_every_n_block'],
+                            dropout=0.1)
 
-    model = ConformerHybrid(num_vocab=tokenizer.vocab_size()+1,
-                        inter_d_model=config['model']['inter_d_model'],
-                        n_mel=config['model']['n_mel'],
-                        time_factor=config['model']['time_factor'],
-                        chunk_size=config['model']['chunk_size'],
-                        context_chunk_number=config['model']['context_chunk_number'],
-                        freq_dim=config['FFT']['hop_length']+1,
-                        n_heads=config['model']['n_heads'],
-                        n_groups=config['model']['n_groups'],
-                        layer_num=config['model']['layer_num'],
-                        mamba_every_n_block=config['model']['mamba_every_n_block'],
-                        dropout=0.1)
-    
     # ckpt = torch.load("experiments/gqa_with_mamba_FIXED_2025-11-19-14h35m/checkpoints/model_0001.tar", weights_only=False)
     # ckpt = ckpt["model"]
     # model.load_state_dict(ckpt, strict=True)

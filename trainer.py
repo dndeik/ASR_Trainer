@@ -216,7 +216,7 @@ class Trainer:
         total_wer = 0
         accum_wer = 0
 
-        self.train_dataloader.dataset.explicit_shuffle()
+        # self.train_dataloader.dataset.explicit_shuffle()
         train_bar = tqdm(self.train_dataloader, ncols=160)
         self.optimizer.zero_grad()
 
