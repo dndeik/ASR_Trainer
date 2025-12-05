@@ -284,7 +284,7 @@ class AudioEncoder(nn.Module):
         self.chunk_size = chunk_size
         self.left_context = context_chunk_number * chunk_size
 
-        assert mamba_every_n_block == 0, "'mamba_every_n_block' can't be zero"
+        assert mamba_every_n_block != 0, "'mamba_every_n_block' can't be zero"
         if mamba_every_n_block < 0:
             print("'mamba_every_n_block' is less then zero, only GQA block will be used")
 
