@@ -29,9 +29,8 @@ class Mamba2Config:
         self.nheads = self.d_inner // self.headdim
 
 
-class InferenceCache(NamedTuple):
-    conv_state: Tensor  # (batch, d_inner + 2 * d_state, d_conv)
-    ssm_state: Tensor  # (batch, nheads, headdim, d_state)
+# conv_cache: Tensor (batch, d_inner + 2 * d_state, d_conv)
+# ssm_cache: Tensor (batch, nheads, headdim, d_state)
 
 class Mamba2(nn.Module):
     def __init__(self, args: Mamba2Config):
@@ -64,7 +63,7 @@ class Mamba2(nn.Module):
         self.norm = RMSNorm(args.d_inner)
         self.out_proj = nn.Linear(args.d_inner, args.d_model, bias=False)
 
-    def forward(self, u: Tensor, h: InferenceCache | None = None):
+    def forward(self, u: Tensor):
         """
         Arguments
             u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
@@ -114,10 +113,16 @@ class Mamba2(nn.Module):
         y = self.norm(y, z)
         y = self.out_proj(y)
 
-        h = InferenceCache(conv_state, ssm_state)
-        return y, h
+        return y, (conv_state, ssm_state)
 
-    def forward_chunk(self, u: Tensor, h: InferenceCache | None = None):
+    def init_cache(self, u_batch_shape):
+        conv_cache = torch.zeros(u_batch_shape,
+                                           self.args.d_inner + 2 * self.args.d_state,
+                                           self.args.d_conv - 1)
+        ssm_cache = torch.zeros(u_batch_shape, 1, self.args.nheads, self.args.headdim, self.args.d_state)
+        return conv_cache, ssm_cache
+
+    def forward_chunk(self, u: Tensor, conv_cache, ssm_cache):
         """
         Arguments
             u: (batch, seqlen, d_model) input. seqlen should be a multiple of chunk_size.
@@ -127,16 +132,9 @@ class Mamba2(nn.Module):
             y: (batch, seqlen, d_model) output
             h: updated inference cache after processing `u`
         """
-        if h is None:
-            h = InferenceCache(torch.zeros(u.shape[0],
-                                           self.args.d_inner + 2 * self.args.d_state,
-                                           self.args.d_conv - 1),
-                               torch.zeros(u.shape[0],
-                                           1,
-                                           self.args.nheads,
-                                           self.args.headdim,
-                                           self.args.d_state)
-                               )
+        if conv_cache is None or ssm_cache is None:
+            conv_cache, ssm_cache = self.init_cache(u.shape[0])
+
         self.device = u.device
 
         A = -torch.exp(self.A_log)  # (nheads,)
@@ -158,7 +156,7 @@ class Mamba2(nn.Module):
         )
 
         xBC = silu(
-            self.conv1d(torch.cat((h.conv_state, xBC.transpose(1, 2)), dim=-1)).transpose(1, 2)
+            self.conv1d(torch.cat((conv_cache, xBC.transpose(1, 2)), dim=-1)).transpose(1, 2)
         )  # (batch, seqlen, d_inner + 2 * d_state))
         x, B, C = torch.split(
             xBC, [self.args.d_inner, self.args.d_state, self.args.d_state], dim=-1
@@ -170,7 +168,7 @@ class Mamba2(nn.Module):
             rearrange(B, "b l n -> b l 1 n"),
             rearrange(C, "b l n -> b l 1 n"),
             self.args.chunk_size,
-            h.ssm_state,
+            ssm_cache,
             device=self.device,
         )
         y = y + x * self.D.unsqueeze(-1)
@@ -178,11 +176,10 @@ class Mamba2(nn.Module):
         y = self.norm(y, z)
         y = self.out_proj(y)
 
-        h = InferenceCache(conv_state, ssm_state)
-        return y, h
+        return y, (conv_state, ssm_state)
 
 
-    def step(self, u: Tensor, h: InferenceCache) -> tuple[Tensor, InferenceCache]:
+    def step(self, u: Tensor, conv_state, ssm_state) -> tuple[Tensor, tuple[Tensor]]:
         """Take a single inference step for the current input and hidden state
 
         Unlike attention-based models, RNN-based models (eg Mamba) does not need
@@ -214,11 +211,11 @@ class Mamba2(nn.Module):
         )
 
         # Advance convolution input
-        h.conv_state.copy_(torch.roll(h.conv_state, shifts=-1, dims=-1))
-        h.conv_state[:, :, -1] = xBC
+        conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))
+        conv_state[:, :, -1] = xBC
         # Convolution step
         xBC = torch.sum(
-            h.conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
+            conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1
         )
         xBC += self.conv1d.bias
         xBC = silu(xBC)
@@ -233,14 +230,14 @@ class Mamba2(nn.Module):
         dA = torch.exp(dt * A)  # (batch, nheads)
         x = rearrange(x, "b (h p) -> b h p", p=self.args.headdim)
         dBx = torch.einsum("bh, bn, bhp -> bhpn", dt, B, x)
-        h.ssm_state.copy_(h.ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-        y = torch.einsum("bhpn, bn -> bhp", h.ssm_state, C)
+        ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        y = torch.einsum("bhpn, bn -> bhp", ssm_state, C)
         y = y + rearrange(self.D, "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")
         y = self.norm(y, z)
         y = self.out_proj(y)
 
-        return y.unsqueeze(1), h
+        return y.unsqueeze(1), (conv_state, ssm_state)
 
 
 def segsum(x: Tensor, device: Device = None) -> Tensor:
@@ -352,11 +349,12 @@ if __name__ == "__main__":
     dummy_input = torch.randn(1, 100, d_model)
     full_res, _ = model(dummy_input)
 
-    cache = None
+    conv_cache = None
+    ssm_cache = None
     stream_res = []
     for i in range(0, dummy_input.shape[1], chunk_size):
         chunk = dummy_input[:, i:i + chunk_size, :]
-        chunk_res, cache = model.forward_chunk(chunk, cache)
+        chunk_res, (conv_cache, ssm_cache) = model.forward_chunk(chunk, conv_cache, ssm_cache)
         stream_res.append(chunk_res)
 
     stream_res = torch.cat(stream_res, dim=1)
