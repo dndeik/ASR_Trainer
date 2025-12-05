@@ -178,7 +178,6 @@ class Trainer:
 
         return wer, esti_list, target_list
 
-
     def _model_invoke(self, audio, audio_len, target, target_len):
         target = torch.cat([torch.full((target.shape[0], 1), fill_value=BLANK_TOKEN_ID, device=target.device), target], dim=-1)
         ctc_out, rnnt_out = self.model(audio, audio_len, target, target_len+1)
@@ -204,7 +203,6 @@ class Trainer:
 
         return loss, loss_ctc, loss_rnnt
 
-
     def _train_epoch(self, epoch):
         total_loss = 0
         accum_loss = 0
@@ -224,82 +222,85 @@ class Trainer:
 
         for step, (audio, audio_len, target, target_len) in enumerate(train_bar, 1):
             audio = audio.to(self.device)
-            audio_len = audio_len.to(self.device).long() 
-            corrected_audio_len = audio_len // self.time_factor # TODO: некрасиво
-            corrected_audio_len = corrected_audio_len.long() 
-            target = target.to(self.device).long() 
-            target_len = target_len.to(self.device).long() 
+            audio_len = audio_len.to(self.device).long()
+            corrected_audio_len = audio_len // self.time_factor  # TODO: некрасиво
+            corrected_audio_len = corrected_audio_len.long()
+            target = target.to(self.device).long()
+            target_len = target_len.to(self.device).long()
 
             if self.train_with_amp:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
                     ctc_out, rnnt_out = self._model_invoke(audio, corrected_audio_len, target, target_len)
-                    loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
+                    loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
+                                                                     target_len)
             else:
                 ctc_out, rnnt_out = self._model_invoke(audio, corrected_audio_len, target, target_len)
-                loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
+                loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
+                                                                 target_len)
 
-            if not torch.isnan(loss):
-                cur_loss = loss.item()
-                total_loss += cur_loss
-                accum_loss += cur_loss
+            if torch.isnan(loss):
+                print("Nan loss")
+                continue
 
-                cur_ctc_loss = ctc_loss.item()
-                total_ctc_loss += cur_ctc_loss
-                accum_ctc_loss += cur_ctc_loss
+            cur_loss = loss.item()
+            total_loss += cur_loss
+            accum_loss += cur_loss
 
-                cur_rnnt_loss = rnnt_loss.item()
-                total_rnnt_loss += cur_rnnt_loss
-                accum_rnnt_loss += cur_rnnt_loss
+            cur_ctc_loss = ctc_loss.item()
+            total_ctc_loss += cur_ctc_loss
+            accum_ctc_loss += cur_ctc_loss
 
-                train_bar.desc = '   train[{}/{}][{}]'.format(
-                    epoch, self.epochs, datetime.now().strftime("%Y-%m-%d-%H:%M"))
+            cur_rnnt_loss = rnnt_loss.item()
+            total_rnnt_loss += cur_rnnt_loss
+            accum_rnnt_loss += cur_rnnt_loss
 
-                train_bar.postfix = 'train_loss={:.2f}, step={}'.format(total_loss / step, step // self.accum_step)
+            train_bar.desc = '   train[{}/{}][{}]'.format(
+                epoch, self.epochs, datetime.now().strftime("%Y-%m-%d-%H:%M"))
 
-                # self.optimizer.zero_grad()
+            train_bar.postfix = 'train_loss={:.2f}, step={}'.format(total_loss / step, step // self.accum_step)
 
+            loss = loss / self.accum_step
+
+            if self.train_with_amp:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+            if step % self.accum_step == 0:
                 if self.train_with_amp:
-                    # self.optimizer.zero_grad()
-                    loss = loss / self.accum_step
-                    self.scaler.scale(loss).backward()
-                    if step % self.accum_step == 0:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        self.optimizer.zero_grad()
-                        self.scheduler.step()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
                 else:
-                    loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
                     self.optimizer.step()
-                    self.optimizer.zero_grad()
-                    self.scheduler.step()
 
-                batch_wer, esti_text, target_text = self._calculate_wer(ctc_out, target, type="ctc")
-                total_wer += batch_wer
-                accum_wer += batch_wer
+                self.optimizer.zero_grad()
+                self.scheduler.step()
 
-                log_step = self.accum_step
-                if step % log_step == 0 and self.rank == 0:
-                    print()
-                    print("REF: ", target_text[0])
-                    print("EST: ", esti_text[0])
-                    real_step = (epoch * len(self.train_dataloader) + step) / self.accum_step
-                    self.writer.add_scalars('LR', {'lr': self.optimizer.param_groups[0]['lr']},
-                                            real_step)
-                    self.writer.add_scalars('Monitoring', {'total_loss': accum_loss / log_step,
-                                                           'ctc_loss': accum_ctc_loss / log_step,
-                                                           'rnnt_loss': accum_rnnt_loss / log_step},
-                                            real_step)
-                    self.writer.add_scalars('WER', {'train_wer': accum_wer / log_step},
-                                            real_step)
-                    accum_loss = 0
-                    accum_ctc_loss = 0
-                    accum_rnnt_loss = 0
-                    accum_wer = 0
-            else:
-                print("Nan loss")
+            batch_wer, esti_text, target_text = self._calculate_wer(ctc_out, target, type="ctc")
+            total_wer += batch_wer
+            accum_wer += batch_wer
+
+            log_step = self.accum_step
+            if step % log_step == 0 and self.rank == 0:
+                print()
+                print("REF: ", target_text[0])
+                print("EST: ", esti_text[0])
+                real_step = (epoch * len(self.train_dataloader) + step) / self.accum_step
+                self.writer.add_scalars('LR', {'lr': self.optimizer.param_groups[0]['lr']},
+                                        real_step)
+                self.writer.add_scalars('Monitoring', {'total_loss': accum_loss / log_step,
+                                                       'ctc_loss': accum_ctc_loss / log_step,
+                                                       'rnnt_loss': accum_rnnt_loss / log_step},
+                                        real_step)
+                self.writer.add_scalars('WER', {'train_wer': accum_wer / log_step},
+                                        real_step)
+                accum_loss = 0
+                accum_ctc_loss = 0
+                accum_rnnt_loss = 0
+                accum_wer = 0
 
             if self.world_size > 1 and (self.device != torch.device("cpu")):
                 torch.cuda.synchronize(self.device)
@@ -309,7 +310,6 @@ class Trainer:
             self.writer.add_scalar('Epoch_CTC_Loss/train', total_ctc_loss / step, epoch)
             self.writer.add_scalar('Epoch_RNNT_Loss/train', total_rnnt_loss / step, epoch)
             self.writer.add_scalar('Epoch_WER/train(ctc)', total_wer / step, epoch)
-
 
     @torch.no_grad()
     def _validation_epoch(self, epoch):
@@ -356,7 +356,6 @@ class Trainer:
             self.writer.add_scalar('Epoch_WER/val(rnnt)', total_rnnt_wer / step, epoch)
 
         return total_rnnt_wer / step
-
 
     def train(self):
         if self.resume:
