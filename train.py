@@ -54,18 +54,20 @@ def run(rank, config, args):
                                                         **config['validation_dataloader'], shuffle=False,
                                                         collate_fn=custom_collate_fn)
 
-    model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1,
-                            inter_d_model=config['model']['inter_d_model'],
+    model = ConformerHybrid(num_vocab=tokenizer.vocab_size()+1,
+                            encoder_d_model=config['model']['encoder_d_model'],
+                            predictor_d_model=config['model']['predictor_d_model'],
+                            joiner_d_model=config['model']['joiner_d_model'],
                             n_mel=config['model']['n_mel'],
                             time_factor=config['model']['time_factor'],
                             chunk_size=config['model']['chunk_size'],
                             context_chunk_number=config['model']['context_chunk_number'],
-                            freq_dim=config['FFT']['hop_length'] + 1,
+                            freq_dim=config['FFT']['hop_length']+1,
                             n_heads=config['model']['n_heads'],
                             n_groups=config['model']['n_groups'],
                             layer_num=config['model']['layer_num'],
                             mamba_every_n_block=config['model']['mamba_every_n_block'],
-                            dropout=0.1)
+                            dropout=0.15)
 
     # ckpt = torch.load("experiments/gqa_with_mamba_FIXED_2025-11-19-14h35m/checkpoints/model_0001.tar", weights_only=False)
     # ckpt = ckpt["model"]

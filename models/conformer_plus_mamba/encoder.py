@@ -5,11 +5,13 @@ import math
 from models.conformer_plus_mamba.conv_module import ConvModule
 from models.conformer_plus_mamba.mamba import Mamba2, Mamba2Config
 
+import random
+
 # from conv_module import ConvModule
 # from minimal_mamba import Mamba2, Mamba2Config
 
 
-GLOBAL_EPS = 1e-3
+GLOBAL_EPS = 1e-4
 
 
 def get_mask_cycle(chunk_size, mask_length, left_context=0):
@@ -335,8 +337,14 @@ class AudioEncoder(nn.Module):
         return batch_masks
 
     def forward(self, x, audio_len=None):
-        # GET MASK
+        # # GET MASK
+        # if random.random() > 0.4 or not self.training:
+        #     mask = get_mask_vector(self.chunk_size, x.shape[1] + self.left_context, self.left_context, device=x.device)
+        # else:
+        #     mask = torch.zeros(x.shape[1] + self.left_context, x.shape[1] + self.left_context).to(x.device)
+
         mask = get_mask_vector(self.chunk_size, x.shape[1] + self.left_context, self.left_context, device=x.device)
+
         if audio_len is not None:
             masks = self._cut_masks_with_len_vector(mask, audio_len)
         else:
