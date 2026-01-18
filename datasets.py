@@ -98,7 +98,10 @@ class BucketingSampler(data.Sampler):
                 yield bucket[i:i + self.batch_size]
 
     def __len__(self):
-        return len(self.indices) // self.batch_size
+        return sum(
+            (len(bucket) + self.batch_size - 1) // self.batch_size
+            for bucket in self.buckets
+        )
 
 
 def custom_collate_fn(batch):
