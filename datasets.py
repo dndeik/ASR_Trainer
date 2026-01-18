@@ -1,5 +1,6 @@
 import os
 import time
+import random
 import torch
 import pandas as pd
 import numpy as np
@@ -8,12 +9,15 @@ from pathlib import Path
 from torch.utils import data
 from torch_stft.stft_implementation.stft import STFT
 
+from audiomentations import Compose, PitchShift, HighPassFilter, LowPassFilter, AddGaussianSNR, ApplyImpulseResponse, \
+    AddGaussianNoise, SevenBandParametricEQ, LoudnessNormalization, Gain
+
 BLANK_TOKEN_ID = 1024
 
 
 class MyDataset(data.Dataset):
     def __init__(self, tokenizer, train_manifest, file_num, min_len, max_len, n_fft=512, hop_length=256,
-                 win_length=512):
+                 win_length=512, is_train=False):
         super().__init__()
 
         self.final_df = self.get_files_from_manifest(train_manifest)
@@ -31,6 +35,7 @@ class MyDataset(data.Dataset):
         self.win_length = win_length
 
         self.stft = STFT(n_fft=self.n_fft, hop_length=self.hop_length)
+        self.is_train = is_train
 
     @staticmethod
     def get_files_from_manifest(manifest):
@@ -46,20 +51,109 @@ class MyDataset(data.Dataset):
     def get_audio_lens(self):
         return self.final_df["duration"].to_list()
 
+    def add_augmentations(self, audio, sample_rate=16000):
+        augmentations = []
+        np.random.seed(int(time.time()))
+        num_augmentations = np.random.randint(0, 2)
+
+        if num_augmentations > 0:
+            # EQ
+            if np.random.rand() < 0.4 and num_augmentations > 0:
+                choise = random.choice(["eq", "low-high"])
+                if choise == "eq":
+                    augmentations.append(SevenBandParametricEQ(-6, 6, p=1))
+                    num_augmentations -= 1
+                else:
+                    # High-pass filter
+                    if np.random.rand() < 0.1 and num_augmentations > 0:
+                        min_cutoff_freq = 300
+                        max_cutoff_freq = 900
+                        augmentations.append(HighPassFilter(min_cutoff_freq=min_cutoff_freq,
+                                                            max_cutoff_freq=max_cutoff_freq,
+                                                            p=1))
+                        num_augmentations -= 1
+
+                    # Low-pass filter
+                    if np.random.rand() < 0.1 and num_augmentations > 0:
+                        min_cutoff_freq = 1800
+                        max_cutoff_freq = 3200
+                        augmentations.append(LowPassFilter(min_cutoff_freq=min_cutoff_freq,
+                                                           max_cutoff_freq=max_cutoff_freq,
+                                                           p=1))
+                        num_augmentations -= 1
+
+            # Pitch shift
+            if np.random.rand() < 0.18 and num_augmentations > 0:
+                min_semitones_rand = -4
+                max_semitones_rand = 4
+                augmentations.append(PitchShift(min_semitones=min_semitones_rand,
+                                                max_semitones=max_semitones_rand,
+                                                p=1))
+                num_augmentations -= 1
+
+            # Loudness Normalization
+            if np.random.rand() < 0.3 and num_augmentations > 0:
+                augmentations.append(LoudnessNormalization(p=1))
+                num_augmentations -= 1
+
+            # Gain
+            if np.random.rand() < 0.3 and num_augmentations > 0:
+                augmentations.append(Gain(p=1))
+                num_augmentations -= 1
+        augs = Compose(augmentations)
+
+        audio = augs(audio, sample_rate=sample_rate)
+        audio = self.add_noise_and_reverb(audio, sample_rate)
+
+        return audio
+
+    @staticmethod
+    def add_noise_and_reverb(audio, sample_rate=16000, add_gauss=True):
+        transform_impulse_response = ApplyImpulseResponse(
+            ir_path=r"/rir_folder", p=1)  # TODO: get from config
+
+        transform_gaussian_noise = AddGaussianNoise(
+            min_amplitude=0.001,
+            max_amplitude=0.005,
+            p=1
+        )
+
+        if random.random() < 0.15:
+            audio_reverbed = transform_impulse_response(audio, sample_rate=sample_rate)
+            random_const = np.random.uniform(0.11, 0.35)
+            audio_reverbed = audio_reverbed * random_const
+            audio = audio_reverbed + (audio * (1 - random_const))
+
+        if random.random() < 0.3 and add_gauss:
+            audio = transform_gaussian_noise(audio, sample_rate=sample_rate)
+
+        # Gaussian SNR
+        if random.random() < 0.2:
+            min_snr = np.random.randint(12, 14)
+            max_snr = np.random.randint(15, 20)
+            gauss_snr = AddGaussianSNR(min_snr_db=min_snr, max_snr_db=max_snr, p=1)
+            audio = gauss_snr(audio, sample_rate=sample_rate)
+
+        return audio
+
     def __getitem__(self, idx):
         file = self.final_df.iloc[idx]
         audio_file_path = os.path.join(self.root_audio_folder, file["audio_filepath"])
         audio, sr = librosa.load(audio_file_path)
         if sr != self.sampling_rate:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
+
+        if self.is_train:
+            audio = self.add_augmentations(audio, self.sampling_rate)
+
         encoded_ids = self.tokenizer.encode(file["text"], out_type=int)
         encoded_ids = [el for el in encoded_ids if
                        el != 0]  # Drop unknown tokens for target, because models must not predict it
 
-        audio = self.stft.transform(torch.from_numpy(audio).float().unsqueeze(0))[0]
-        audio = audio.transpose(0, 2)
+        audio = self.stft.transform(torch.from_numpy(audio).float().unsqueeze(0))
+        audio = audio.transpose(1, 3)
 
-        return audio, torch.tensor(encoded_ids)
+        return audio[0], torch.tensor(encoded_ids)
 
     def __len__(self):
         return len(self.final_df)

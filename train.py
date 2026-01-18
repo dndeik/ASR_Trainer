@@ -40,7 +40,7 @@ def run(rank, config, args):
         torch.cuda.set_device(rank)
         dist.barrier()
 
-    train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], **config['FFT'])
+    train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], **config['FFT'], is_train=True)
     train_sampler = BucketingSampler(train_dataset.get_audio_lens(), config["train_dataloader"]["batch_size"])
     train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_sampler=train_sampler,
                                                    pin_memory=config['train_dataloader']['pin_memory'],
@@ -48,7 +48,7 @@ def run(rank, config, args):
                                                    shuffle=False,
                                                    collate_fn=custom_collate_fn)
 
-    validation_dataset = MyDataset(tokenizer=tokenizer, **config['validation_dataset'], **config['FFT'])
+    validation_dataset = MyDataset(tokenizer=tokenizer, **config['validation_dataset'], **config['FFT'], is_train=False)
     validation_sampler = torch.utils.data.distributed.DistributedSampler(validation_dataset) if multi_gpu else None
     validation_dataloader = torch.utils.data.DataLoader(dataset=validation_dataset, sampler=validation_sampler,
                                                         **config['validation_dataloader'], shuffle=False,
