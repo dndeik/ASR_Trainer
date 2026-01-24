@@ -41,6 +41,7 @@ def run(rank, config, args):
         dist.barrier()
 
     train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], **config['FFT'], is_train=True)
+    train_dataset.set_augmentations(**config["augmentations"])
     train_sampler = BucketingSampler(train_dataset.get_audio_lens(), config["train_dataloader"]["batch_size"])
     train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_sampler=train_sampler,
                                                    pin_memory=config['train_dataloader']['pin_memory'],

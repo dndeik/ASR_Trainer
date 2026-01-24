@@ -17,7 +17,7 @@ BLANK_TOKEN_ID = 1024
 
 class MyDataset(data.Dataset):
     def __init__(self, tokenizer, train_manifest, file_num, min_len, max_len, n_fft=512, hop_length=256,
-                 win_length=512, is_train=False):
+                 win_length=512, augs_enable=False, is_train=False):
         super().__init__()
 
         self.final_df = self.get_files_from_manifest(train_manifest)
@@ -35,7 +35,20 @@ class MyDataset(data.Dataset):
         self.win_length = win_length
 
         self.stft = STFT(n_fft=self.n_fft, hop_length=self.hop_length)
+
         self.is_train = is_train
+
+        # Augs
+        self.augs_enable = augs_enable
+        self.max_augs = 2
+        self.rir_folder = None
+
+    def set_augmentations(self, augs_enable=False, rir_folder=None, max_augs=2):
+        self.augs_enable = augs_enable
+        self.max_augs = max_augs
+        assert self.max_augs >= 0, "Max augs should be >= 0"
+        self.rir_folder = rir_folder
+        print(f"Augmentations add: {self.augs_enable}")
 
     @staticmethod
     def get_files_from_manifest(manifest):
@@ -54,7 +67,7 @@ class MyDataset(data.Dataset):
     def add_augmentations(self, audio, sample_rate=16000):
         augmentations = []
         np.random.seed(int(time.time()))
-        num_augmentations = np.random.randint(0, 2)
+        num_augmentations = np.random.randint(0, self.max_augs)
 
         if num_augmentations > 0:
             # EQ
@@ -107,24 +120,23 @@ class MyDataset(data.Dataset):
 
         return audio
 
-    @staticmethod
-    def add_noise_and_reverb(audio, sample_rate=16000, add_gauss=True):
-        transform_impulse_response = ApplyImpulseResponse(
-            ir_path=r"/rir_folder", p=1)  # TODO: get from config
+    def add_noise_and_reverb(self, audio, sample_rate=16000, add_gauss=True):
+        if random.random() < 0.15 and self.rir_folder is not None:
+            transform_impulse_response = ApplyImpulseResponse(
+                ir_path=self.rir_folder, p=1)
 
-        transform_gaussian_noise = AddGaussianNoise(
-            min_amplitude=0.001,
-            max_amplitude=0.005,
-            p=1
-        )
-
-        if random.random() < 0.15:
             audio_reverbed = transform_impulse_response(audio, sample_rate=sample_rate)
             random_const = np.random.uniform(0.11, 0.35)
             audio_reverbed = audio_reverbed * random_const
             audio = audio_reverbed + (audio * (1 - random_const))
 
         if random.random() < 0.3 and add_gauss:
+            transform_gaussian_noise = AddGaussianNoise(
+                min_amplitude=0.001,
+                max_amplitude=0.005,
+                p=1
+            )
+
             audio = transform_gaussian_noise(audio, sample_rate=sample_rate)
 
         # Gaussian SNR
@@ -143,7 +155,7 @@ class MyDataset(data.Dataset):
         if sr != self.sampling_rate:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
 
-        if self.is_train:
+        if self.is_train and self.augs_enable:
             audio = self.add_augmentations(audio, self.sampling_rate)
 
         encoded_ids = self.tokenizer.encode(file["text"], out_type=int)

@@ -54,6 +54,11 @@ batch_size = 36
 num_workers = 12
 pin_memory = true
 
+[augmentations]
+augs_enable = true
+max_augs = 2
+rir_folder = "./rir_room_16kHZ"
+
 [logger]
 log_to_clearml = false
 
