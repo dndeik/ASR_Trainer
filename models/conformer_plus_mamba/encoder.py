@@ -5,8 +5,6 @@ import math
 from models.conformer_plus_mamba.conv_module import ConvModule
 from models.conformer_plus_mamba.mamba import Mamba2, Mamba2Config
 
-import random
-
 # from conv_module import ConvModule
 # from minimal_mamba import Mamba2, Mamba2Config
 
@@ -14,48 +12,64 @@ import random
 GLOBAL_EPS = 1e-4
 
 
-def get_mask_cycle(chunk_size, mask_length, left_context=0):
-    # if self.mask is None or mask_length != self.mask.size()[1]:
-    corrected_mask_length = (mask_length + chunk_size) // chunk_size * chunk_size
-    mask = torch.zeros(corrected_mask_length, corrected_mask_length + left_context)
-    chunk = torch.ones(chunk_size, chunk_size + left_context)
-    for i in range(0, mask_length, chunk_size):
-        # print(i, i + chunk_size + left_context)
-        mask[i:i + chunk_size, i:i + chunk_size + left_context] = chunk
+def get_mask_cycle(chunk_size, mask_length, left_context=0, right_context=0):
+    # округляем длину под чанки
+    corrected_mask_length = math.ceil(mask_length / chunk_size) * chunk_size
 
-    mask = mask[:mask_length, left_context:mask_length + left_context]
+    # общая ширина с учетом левого и правого контекста
+    total_width = corrected_mask_length + left_context + right_context
 
-    # self.mask = ~mask.bool()
+    mask = torch.zeros(corrected_mask_length, total_width)
+
+    for i in range(0, corrected_mask_length, chunk_size):
+        row_start = i
+        row_end = i + chunk_size
+
+        col_start = i
+        col_end = i + chunk_size + left_context + right_context
+
+        mask[row_start:row_end, col_start:col_end] = 1.0
+
+    # обрезаем до реальной длины
+    mask = mask[:mask_length, left_context:left_context + mask_length]
+
+    # переводим в attention mask
     mask = ~mask.bool() * float("-inf")
     mask = torch.nan_to_num(mask, neginf=float("-inf"))
+
     return mask
 
 
-def get_mask_vector(chunk_size, mask_length, left_context=0, device=None):
+def get_mask_vector(chunk_size, mask_length, left_context=0, right_context=0, device=None):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 1. Выравниваем размер
     corrected_length = (mask_length + chunk_size - 1) // chunk_size * chunk_size
 
-    # 2. Получаем матрицу индексов [corrected_length, corrected_length + left_context]
+    # 2. Матрицы индексов
     row_idx = torch.arange(corrected_length, device=device).unsqueeze(1)  # [L, 1]
-    col_idx = torch.arange(corrected_length + left_context, device=device).unsqueeze(0)  # [1, L+LC]
+    col_idx = torch.arange(
+        corrected_length + left_context + right_context,
+        device=device
+    ).unsqueeze(0)  # [1, L+LC+RC]
 
-    # 3. Вычисляем маску: какие позиции могут видеть друг друга
-    # Каждая строка принадлежит чанку: [0, chunk_size), [chunk_size, 2*chunk_size), ...
+    # 3. Индекс чанка
     row_chunk = row_idx // chunk_size  # [L, 1]
-    col_chunk = col_idx // chunk_size  # [1, L+LC]
 
-    # 4. Строим базовую маску:
-    # attention разрешён, если позиция в колонке принадлежит текущему чанку строки
-    # и находится в пределах [start_col, start_col + chunk_size + left_context)
+    # 4. Границы допустимого внимания
     start_col = row_chunk * chunk_size  # [L, 1]
-    chunk_mask = (col_idx >= start_col) & (col_idx < start_col + chunk_size + left_context)  # [L, L+LC]
+    end_col = start_col + chunk_size + left_context + right_context
 
-    # 5. Обрезаем до [mask_length, mask_length]
-    chunk_mask = chunk_mask[:mask_length, left_context:left_context + mask_length]  # [mask_length, mask_length]
+    # 5. Маска допустимых позиций
+    chunk_mask = (col_idx >= start_col) & (col_idx < end_col)  # [L, L+LC+RC]
 
-    # 6. Преобразуем в attention mask: 0.0 где разрешено, -inf где запрещено
+    # 6. Обрезаем до реальной длины
+    chunk_mask = chunk_mask[
+        :mask_length,
+        left_context:left_context + mask_length
+    ]  # [mask_length, mask_length]
+
+    # 7. Attention mask
     attn_mask = torch.where(chunk_mask, 0.0, float('-inf'))
 
     return attn_mask
@@ -77,19 +91,21 @@ class DropPath(nn.Module):
 
 
 class BaseEncoderBlock(nn.Module):
-    def __init__(self, type: str, d_model, n_heads, n_groups, chunk_size, left_context, dropout=0.):
+    def __init__(self, type: str, d_model, n_heads, n_groups, chunk_size, left_context, right_context=0, dropout=0.):
         super().__init__()
         self.chunk_size = chunk_size
         self.left_context = left_context
+        self.right_context = right_context
         self.n_heads = n_heads
         assert type in ['attn', 'mamba'], "Type must be 'attn' or 'mamba'"
         self.type = type
+        max_rel_pos = math.ceil((self.chunk_size + self.left_context + self.right_context) / self.chunk_size) * self.chunk_size
 
         self.pre_attn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
         if self.type == 'attn':
-            self.block = GQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_groups, max_position=chunk_size+left_context, bias=False, dropout=dropout,)
+            self.block = GQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_groups, max_position=max_rel_pos, bias=False, dropout=dropout,)
         elif self.type == 'mamba':
-            self.block = Mamba2(Mamba2Config(d_model=d_model, chunk_size=chunk_size))
+            self.block = Mamba2(Mamba2Config(d_model=d_model, chunk_size=chunk_size, expand=1))
 
         self.pre_conv_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
         self.conv_block = ConvModule(d_model, 9, dropout=dropout)
@@ -105,8 +121,6 @@ class BaseEncoderBlock(nn.Module):
         x = self.pre_attn_norm(x)
         if self.type == 'attn':
             padded_x = torch.cat((torch.zeros((B, self.left_context, D), device=x.device, dtype=x.dtype), x), dim=1)
-            # x = x + self.dropout(self.block(padded_x, padded_x, padded_x, attn_mask=attn_mask, need_weights=False)[0][
-            #                          :, self.left_context:, :])
             x = x + self.drop_block(self.block(padded_x, attn_mask=attn_mask)[:, self.left_context:, :])
         else:
             pad_len = (x.shape[1] + self.chunk_size-1) // self.chunk_size * self.chunk_size - x.shape[1]
@@ -172,9 +186,9 @@ class GQASelfAttention(nn.Module):
         bsz, tgt_len, _ = x.size()
 
         x = x.transpose(0, 1)
-        q = self.q_proj(x).view(tgt_len, bsz*self.num_query_heads, self.head_dim).transpose(0, 1) 
-        k_t = self.k_proj(x).view(tgt_len, bsz*self.num_kv_heads, self.head_dim).permute(1, 2, 0) 
-        v = self.v_proj(x).view(tgt_len, bsz*self.num_kv_heads, self.head_dim).transpose(0, 1) 
+        q = self.q_proj(x).view(tgt_len, bsz*self.num_query_heads, self.head_dim).transpose(0, 1)
+        k_t = self.k_proj(x).view(tgt_len, bsz*self.num_kv_heads, self.head_dim).permute(1, 2, 0)
+        v = self.v_proj(x).view(tgt_len, bsz*self.num_kv_heads, self.head_dim).transpose(0, 1)
 
         # Повторяем K/V по kv_repeat_factor вдоль head-дим (bsz, num_q_heads, tgt_len, dim)
         k_t = k_t.repeat_interleave(self.kv_repeat_factor, dim=0)
@@ -279,12 +293,13 @@ class GQASelfAttentionRelPos(nn.Module):
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, inter_d_model, chunk_size, context_chunk_number, n_heads, n_groups, layer_num=1, mamba_every_n_block=3, dropout=0.1):
+    def __init__(self, inter_d_model, chunk_size, left_context_chunk_number, right_context_chunk_number, n_heads, n_groups, layer_num=1, mamba_every_n_block=3, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
         self.dropout = dropout
         self.chunk_size = chunk_size
-        self.left_context = context_chunk_number * chunk_size
+        self.left_context = int(left_context_chunk_number * chunk_size)
+        self.right_context = int(right_context_chunk_number * chunk_size)
 
         assert mamba_every_n_block != 0, "'mamba_every_n_block' can't be zero"
         if mamba_every_n_block < 0:
@@ -294,7 +309,7 @@ class AudioEncoder(nn.Module):
         self.blocks = nn.ModuleList()
         for i in range(layer_num):
             block_type = "mamba" if (i+1) % mamba_every_n_block == 0 and use_mamba else "attn"
-            self.blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context, dropout))
+            self.blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context, self.right_context, dropout))
 
     def _cut_masks_with_len_cycle(self, mask, lens):
         B, L = lens.shape
@@ -337,13 +352,7 @@ class AudioEncoder(nn.Module):
         return batch_masks
 
     def forward(self, x, audio_len=None):
-        # # GET MASK
-        # if random.random() > 0.4 or not self.training:
-        #     mask = get_mask_vector(self.chunk_size, x.shape[1] + self.left_context, self.left_context, device=x.device)
-        # else:
-        #     mask = torch.zeros(x.shape[1] + self.left_context, x.shape[1] + self.left_context).to(x.device)
-
-        mask = get_mask_vector(self.chunk_size, x.shape[1] + self.left_context, self.left_context, device=x.device)
+        mask = get_mask_vector(self.chunk_size, x.shape[1] + self.left_context, self.left_context, self.right_context, device=x.device)
 
         if audio_len is not None:
             masks = self._cut_masks_with_len_vector(mask, audio_len)
