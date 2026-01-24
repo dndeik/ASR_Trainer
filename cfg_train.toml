@@ -28,9 +28,9 @@ tokenizer_path = "models/ru_tokenizer/tokenizer_spe_bpe_cp"
 listener_sr = 16000
 
 [FFT]
-n_fft = 320
-hop_length = 160
-win_length = 320
+n_fft = 480
+hop_length = 240
+win_length = 480
 
 [train_dataset]
 train_manifest = "/opt/datasets/ASR_data/CAPITALIZED_TRAIN_FINAL.jsonl" # Put the path to your train dataset
