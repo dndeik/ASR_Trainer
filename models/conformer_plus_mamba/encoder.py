@@ -92,7 +92,7 @@ class BaseEncoderBlock(nn.Module):
             self.block = Mamba2(Mamba2Config(d_model=d_model, chunk_size=chunk_size))
 
         self.pre_conv_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
-        self.conv_block = ConvModule(d_model, d_model // 4, dropout=dropout)
+        self.conv_block = ConvModule(d_model, 9, dropout=dropout)
 
         self.pre_ffn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
         self.ffn = SwiGLUFFN(d_model, factor=2)
