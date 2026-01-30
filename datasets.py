@@ -1,6 +1,7 @@
 import os
 import time
 import random
+import math
 import torch
 import pandas as pd
 import numpy as np
@@ -10,7 +11,7 @@ from torch.utils import data
 from torch_stft.stft_implementation.stft import STFT
 
 from audiomentations import Compose, PitchShift, HighPassFilter, LowPassFilter, AddGaussianSNR, ApplyImpulseResponse, \
-    AddGaussianNoise, SevenBandParametricEQ, LoudnessNormalization, Gain
+    AddGaussianNoise, SevenBandParametricEQ, LoudnessNormalization, Gain, Mp3Compression
 
 BLANK_TOKEN_ID = 1024
 
@@ -40,14 +41,23 @@ class MyDataset(data.Dataset):
 
         # Augs
         self.augs_enable = augs_enable
+        self.min_augs = 0
         self.max_augs = 2
         self.rir_folder = None
+        self.noise_files = None
 
-    def set_augmentations(self, augs_enable=False, rir_folder=None, max_augs=2):
+    def set_augmentations(self, augs_enable=False, rir_folder=None, noise_folder="", min_augs=0, max_augs=2):
         self.augs_enable = augs_enable
+        self.min_augs = min_augs
         self.max_augs = max_augs
+        assert self.min_augs >= 0, "Min augs should be >= 0"
         assert self.max_augs >= 0, "Max augs should be >= 0"
         self.rir_folder = rir_folder
+        if noise_folder:
+            audio_formats = ["mp3", "wav", "flac"]
+            self.noise_files = []
+            for format in audio_formats:
+                self.noise_files.extend(list(Path(noise_folder).absolute().rglob(f"*{format}")))
         print(f"Augmentations add: {self.augs_enable}")
 
     @staticmethod
@@ -67,14 +77,14 @@ class MyDataset(data.Dataset):
     def add_augmentations(self, audio, sample_rate=16000):
         augmentations = []
         np.random.seed(int(time.time()))
-        num_augmentations = np.random.randint(0, self.max_augs)
+        num_augmentations = np.random.randint(self.min_augs, self.max_augs)
 
         if num_augmentations > 0:
             # EQ
             if np.random.rand() < 0.4 and num_augmentations > 0:
                 choise = random.choice(["eq", "low-high"])
                 if choise == "eq":
-                    augmentations.append(SevenBandParametricEQ(-6, 6, p=1))
+                    augmentations.append(SevenBandParametricEQ(-9, 9, p=1))
                     num_augmentations -= 1
                 else:
                     # High-pass filter
@@ -95,6 +105,22 @@ class MyDataset(data.Dataset):
                                                            p=1))
                         num_augmentations -= 1
 
+            # Gain
+            if np.random.rand() < 0.3 and num_augmentations > 0:
+                augmentations.append(Gain(p=1))
+                num_augmentations -= 1
+
+            # Mp3Compression
+            if np.random.rand() < 0.3 and num_augmentations > 0:
+                augmentations.append(Mp3Compression(
+                    min_bitrate=16,
+                    max_bitrate=96,
+                    backend="fast-mp3-augment",
+                    preserve_delay=False,
+                    p=1.0
+                ))
+                num_augmentations -= 1
+
             # Pitch shift
             if np.random.rand() < 0.18 and num_augmentations > 0:
                 min_semitones_rand = -4
@@ -109,10 +135,6 @@ class MyDataset(data.Dataset):
                 augmentations.append(LoudnessNormalization(p=1))
                 num_augmentations -= 1
 
-            # Gain
-            if np.random.rand() < 0.3 and num_augmentations > 0:
-                augmentations.append(Gain(p=1))
-                num_augmentations -= 1
         augs = Compose(augmentations)
 
         audio = augs(audio, sample_rate=sample_rate)
@@ -148,12 +170,36 @@ class MyDataset(data.Dataset):
 
         return audio
 
+    def add_bg_noise(self, audio, min_coef=0.1, max_coef=0.5, p=1.):
+        if random.random() < p:
+            random_noise = random.choice(self.noise_files)
+            noise, sr = librosa.load(random_noise)
+            if sr != self.sampling_rate:
+                noise = librosa.resample(noise, orig_sr=sr, target_sr=self.sampling_rate)
+
+            final_len = audio.shape[-1]
+            if len(noise) < final_len:
+                factor = math.ceil(final_len / len(noise))
+                noise = np.concat([noise for _ in range(factor)], axis=-1)[:final_len]
+            else:
+                start = random.randint(0, len(noise) - final_len)
+                noise = noise[start: start + final_len]
+
+            noise = noise * random.uniform(min_coef, max_coef)
+            noise = noise[:audio.shape[-1]]
+            audio = noise + audio
+
+        return audio
+
     def __getitem__(self, idx):
         file = self.final_df.iloc[idx]
         audio_file_path = os.path.join(self.root_audio_folder, file["audio_filepath"])
         audio, sr = librosa.load(audio_file_path)
         if sr != self.sampling_rate:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
+
+        if self.noise_files:
+            audio = self.add_bg_noise(audio, min_coef=0.2, max_coef=0.45, p=0.7)
 
         if self.is_train and self.augs_enable:
             audio = self.add_augmentations(audio, self.sampling_rate)

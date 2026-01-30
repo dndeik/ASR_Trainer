@@ -8,3 +8,4 @@ werpy==3.1.0
 librosa==0.11.0
 audiomentations==0.43.1
 loudness==0.2.0
+fast-mp3-augment==0.2.0

@@ -57,8 +57,11 @@ pin_memory = true
 
 [augmentations]
 augs_enable = true
+min_augs = 1
 max_augs = 2
+noise_folder = "./noise_subset"
 rir_folder = "./rir_room_16kHZ"
+
 
 [logger]
 log_to_clearml = false
