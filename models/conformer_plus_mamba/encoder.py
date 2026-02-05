@@ -6,7 +6,7 @@ from models.common_modules.regularization import DropPath
 from models.common_modules.transformer_modules import SwiGLUFFN, GQASelfAttentionRelPos
 from models.conformer_plus_mamba.conv_module import ConvModule
 from models.conformer_plus_mamba.mamba import Mamba2, Mamba2Config
-from utils.masking import get_mask_vector, cut_masks_with_len_vector
+from utils.masking import get_mask_vector, cut_masks_with_len_vector, fix_full_masked_lines
 
 # from conv_module import ConvModule
 # from minimal_mamba import Mamba2, Mamba2Config
@@ -91,6 +91,7 @@ class AudioEncoder(nn.Module):
             masks = cut_masks_with_len_vector(mask, audio_len, self.left_context)
         else:
             masks = mask.unsqueeze(0).expand(x.shape[0], -1, -1)  # (B, L, L)
+        masks = fix_full_masked_lines(masks)
         masks = torch.repeat_interleave(masks, self.n_heads, 0)
 
         for module in self.blocks:

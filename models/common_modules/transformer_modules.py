@@ -38,15 +38,14 @@ class GQASelfAttention(nn.Module):
         k_t = k_t.repeat_interleave(self.kv_repeat_factor, dim=0)
         v = v.repeat_interleave(self.kv_repeat_factor, dim=0)
 
-        q_scaled = q * math.sqrt(1.0 / float(self.head_dim))
-        if attn_mask is not None:
-            attn_output_weights = torch.baddbmm(
-                attn_mask, q_scaled, k_t
-            )
-        else:
-            attn_output_weights = torch.bmm(q_scaled, k_t)
-        attn_output_weights = F.softmax(attn_output_weights, dim=-1)
+        q_scaled = q * math.sqrt(1.0 / self.head_dim)
 
+        attn_output_weights = torch.bmm(q_scaled, k_t)
+
+        if attn_mask is not None:
+            attn_output_weights = torch.masked_fill(attn_output_weights, attn_mask, float("-inf"))
+
+        attn_output_weights = F.softmax(attn_output_weights, dim=-1)
         attn_output_weights = self.dropout(attn_output_weights)
 
         attn_output = torch.bmm(attn_output_weights, v)
@@ -109,7 +108,7 @@ class GQASelfAttentionRelPos(nn.Module):
         attn_output_weights = attn_output_weights + rel_bias_term
 
         if attn_mask is not None:
-            attn_output_weights = attn_output_weights + attn_mask
+            attn_output_weights = torch.masked_fill(attn_output_weights, attn_mask, float("-inf"))
 
         attn_output_weights = F.softmax(attn_output_weights, dim=-1)
         attn_output_weights = self.dropout(attn_output_weights)

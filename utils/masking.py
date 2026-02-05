@@ -22,11 +22,10 @@ def get_mask_cycle(chunk_size, mask_length, left_context=0, right_context=0):
         mask[row_start:row_end, col_start:col_end] = 1.0
 
     # обрезаем до реальной длины
-    mask = mask[:mask_length, left_context:left_context + mask_length]
+    mask = mask[:mask_length, :mask_length]
 
     # переводим в attention mask
-    mask = ~mask.bool() * float("-inf")
-    mask = torch.nan_to_num(mask, neginf=float("-inf"))
+    mask = ~mask.bool()
 
     return mask
 
@@ -57,11 +56,11 @@ def get_mask_vector(chunk_size, mask_length, left_context=0, right_context=0, de
     # 6. Обрезаем до реальной длины
     chunk_mask = chunk_mask[
         :mask_length,
-        left_context:left_context + mask_length
+        :mask_length
     ]  # [mask_length, mask_length]
 
     # 7. Attention mask
-    attn_mask = torch.where(chunk_mask, 0.0, float('-inf'))
+    attn_mask = ~chunk_mask
 
     return attn_mask
 
@@ -70,8 +69,8 @@ def cut_masks_with_len_vector(mask, lens, left_context):
     B = lens.size(0)
     L = mask.size(0)  # размер базовой маски
 
-    # Заполним маски -inf (замаскированные)
-    batch_masks = torch.full((B, L, L), fill_value=-5e4, device=mask.device)
+    # Заполним маски True (замаскированные)
+    batch_masks = torch.full((B, L, L), fill_value=True, device=mask.device)
 
     # Индексы для строк и столбцов
     rows = torch.arange(L, device=mask.device).unsqueeze(0).expand(B, -1)  # (B, L)
@@ -100,9 +99,44 @@ def cut_masks_with_len_cycle(mask, lens, left_context):
     B, L = lens.shape
     masks = []
     for i in range(B):
-        cur_masks = torch.full_like(mask, fill_value=-5e4, device=mask.device)
+        cur_masks = torch.full_like(mask, fill_value=True, device=mask.device)
         cur_masks[:lens[i] + left_context, :lens[i] + left_context] = mask[
             :lens[i] + left_context, :lens[i] + left_context]
         masks.append(cur_masks)
     masks = torch.stack(masks)
     return masks
+
+
+def fix_full_masked_lines(mask):
+    """
+    mask: BoolTensor [..., T, T]
+        True  = masked
+        False = allowed
+
+    Returns:
+        BoolTensor same shape, where fully-masked rows
+        have exactly one False on the diagonal.
+    """
+    *prefix, T, _ = mask.shape
+    device = mask.device
+
+    # 1. Найти строки, где ВСЁ True
+    # shape: [..., T, 1]
+    full_masked = mask.all(dim=-1, keepdim=True)
+
+    if not full_masked.any():
+        return mask
+
+    # 2. Диагональ: False на диагонали, True везде ещё
+    eye = torch.eye(T, device=device, dtype=torch.bool)
+    diag_fix = ~eye.unsqueeze(0).expand(*prefix, T, T)
+
+    # 3. Заменяем ТОЛЬКО полностью замаскированные строки
+    mask = torch.where(
+        full_masked,
+        diag_fix,
+        mask
+    )
+
+    return mask
+
