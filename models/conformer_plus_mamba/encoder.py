@@ -118,20 +118,24 @@ class BaseEncoderBlock(nn.Module):
     def forward(self, x, attn_mask):
         B, L, D = x.shape
 
+        residual = x
         x = self.pre_attn_norm(x)
         if self.type == 'attn':
             padded_x = torch.cat((torch.zeros((B, self.left_context, D), device=x.device, dtype=x.dtype), x), dim=1)
-            x = x + self.drop_block(self.block(padded_x, attn_mask=attn_mask)[:, self.left_context:, :])
+            x = self.block(padded_x, attn_mask=attn_mask)[:, self.left_context:, :]
         else:
             pad_len = (x.shape[1] + self.chunk_size-1) // self.chunk_size * self.chunk_size - x.shape[1]
             padded_x = torch.cat((x, torch.zeros((B, pad_len, D), device=x.device, dtype=x.dtype)), dim=1)
-            x = x + self.drop_block(self.block(padded_x)[0][:, :L, :])
+            x = self.block(padded_x)[0][:, :L, :]
+        x = residual + self.drop_block(x)
 
+        residual = x
         x = self.pre_conv_norm(x)
-        x = x + self.drop_block(self.conv_block(x))
+        x = residual + self.drop_block(self.conv_block(x))
 
+        residual = x
         x = self.pre_ffn_norm(x)
-        x = x + self.drop_block(self.ffn(x))
+        x = residual + self.drop_block(self.ffn(x))
 
         return x
 

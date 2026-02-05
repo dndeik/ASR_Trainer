@@ -207,7 +207,7 @@ class SimpleJoiner(nn.Module):
 
         joint = enc_exp + pred_exp  # [B, T, U, joint_dim]
         joint = self.act(joint)
-        joint = self.dropout(joint)
+        # joint = self.dropout(joint)
 
         out = self.fc_out(joint)  # [B, T, U, num_vocab]
         return out
@@ -222,16 +222,12 @@ class ConformerHybrid(nn.Module):
         # Encoder part
         downsampled_chunk_size = chunk_size // time_factor
         self.features_extractor = FeaturesExractor(freq_dim, n_mel, chunk_size=chunk_size, eps=GLOBAL_EPS)
-        self.spec_aug = SpecAugment(0.15, 0.10, 15, 6)
+        self.spec_aug = SpecAugment(0.05, 0.06, 5, 6)
         self.downsample_conv = DownsampleConv(n_mel, encoder_d_model, k_size=time_factor * 2 + 1, stride=time_factor)
-        self.encoder = AudioEncoder(encoder_d_model, downsampled_chunk_size, left_context_chunk_number,
-                                    right_context_chunk_number, n_heads, n_groups, layer_num, mamba_every_n_block,
-                                    dropout)
-        self.post_norm = nn.LayerNorm(encoder_d_model, eps=GLOBAL_EPS)
+        self.encoder = AudioEncoder(encoder_d_model, downsampled_chunk_size, left_context_chunk_number, right_context_chunk_number, n_heads, n_groups, layer_num, mamba_every_n_block, dropout)
 
         # CTC head
         self.ctc_conv = CTCConv(encoder_d_model, encoder_d_model, 7)
-        self.post_ctc_dec_norm = nn.LayerNorm(encoder_d_model, eps=GLOBAL_EPS)
         self.ctc_classifier = nn.Sequential(nn.Linear(encoder_d_model, 2 * encoder_d_model),
                                             nn.SiLU(),
                                             nn.Dropout(dropout),
@@ -239,51 +235,31 @@ class ConformerHybrid(nn.Module):
 
         # RNNT part
         self.rnnt_decoder = Decoder(num_vocab, predictor_d_model, predictor_d_model)
-        self.post_rnnt_dec_norm = nn.LayerNorm(predictor_d_model, eps=GLOBAL_EPS)
-        self.rnnt_classifier = SimpleJoiner(encoder_d_model, predictor_d_model, joiner_d_model, num_vocab,
-                                            dropout=dropout)
+        self.rnnt_classifier = SimpleJoiner(encoder_d_model, predictor_d_model, joiner_d_model, num_vocab, dropout=dropout)
 
         self.dropout = nn.Dropout(dropout)
-
-    def freeze_encoder(self):
-        def unfreeze_module(module):
-            for p in module.parameters():
-                p.requires_grad = True
-
-        for p in self.parameters():
-            p.requires_grad = False
-
-        # CTC
-        unfreeze_module(self.ctc_decoder)
-        unfreeze_module(self.post_ctc_dec_norm)
-        unfreeze_module(self.ctc_classifier)
-
-        # RNNT
-        unfreeze_module(self.rnnt_decoder)
-        unfreeze_module(self.post_rnnt_dec_norm)
-        unfreeze_module(self.rnnt_classifier)
 
     def forward(self, x, audio_len, targets, targets_len):
         # [B, C, T, F]
         x = self.features_extractor(x)
-        # x = self.spec_aug(x, audio_len)
+        x = self.spec_aug(x, audio_len)
         x = self.downsample_conv(x)
         # x = self.dropout(x)
-        x = self.encoder(x, audio_len)
-        enc_out = self.dropout(self.post_norm(x))
+        enc_out = self.encoder(x, audio_len)
+        # enc_out = self.dropout(enc_out)
 
         # CTC head
         ctc_logits = self.ctc_conv(enc_out)
-        ctc_logits = self.dropout(self.post_ctc_dec_norm(ctc_logits))
+        ctc_logits = self.dropout(ctc_logits)
         ctc_logits = self.ctc_classifier(ctc_logits)
 
         # RNNT head
         dec_out = self.rnnt_decoder(targets, targets_len)
-        dec_out = self.dropout(self.post_rnnt_dec_norm(dec_out))
+        # dec_out = self.dropout(dec_out)
         rnnt_logits = self.rnnt_classifier(enc_out, dec_out)
 
         return ctc_logits, rnnt_logits
-
+    
     def infer_ctc(self, x, audio_len=None, blank_token_id=1024):
         # [B, C, T, F]
         x = self.features_extractor(x)
