@@ -74,7 +74,7 @@ class MyDataset(data.Dataset):
     def get_audio_lens(self):
         return self.final_df["duration"].to_list()
 
-    def add_augmentations(self, audio, sample_rate=16000):
+    def add_augmentations(self, audio, sample_rate=16000, add_gauss=False):
         augmentations = []
         np.random.seed(int(time.time()))
         num_augmentations = np.random.randint(self.min_augs, self.max_augs)
@@ -84,34 +84,34 @@ class MyDataset(data.Dataset):
             if np.random.rand() < 0.4 and num_augmentations > 0:
                 choise = random.choice(["eq", "low-high"])
                 if choise == "eq":
-                    augmentations.append(SevenBandParametricEQ(-9, 9, p=1))
+                    augmentations.append(SevenBandParametricEQ(-10, 10, p=1))
                     num_augmentations -= 1
                 else:
                     # High-pass filter
-                    if np.random.rand() < 0.1 and num_augmentations > 0:
-                        min_cutoff_freq = 300
-                        max_cutoff_freq = 900
+                    if np.random.rand() < 0.2 and num_augmentations > 0:
+                        min_cutoff_freq = 1000
+                        max_cutoff_freq = 1900
                         augmentations.append(HighPassFilter(min_cutoff_freq=min_cutoff_freq,
                                                             max_cutoff_freq=max_cutoff_freq,
                                                             p=1))
                         num_augmentations -= 1
 
                     # Low-pass filter
-                    if np.random.rand() < 0.1 and num_augmentations > 0:
-                        min_cutoff_freq = 1800
-                        max_cutoff_freq = 3200
+                    if np.random.rand() < 0.2 and num_augmentations > 0:
+                        min_cutoff_freq = 700
+                        max_cutoff_freq = 5600
                         augmentations.append(LowPassFilter(min_cutoff_freq=min_cutoff_freq,
                                                            max_cutoff_freq=max_cutoff_freq,
                                                            p=1))
                         num_augmentations -= 1
 
             # Gain
-            if np.random.rand() < 0.3 and num_augmentations > 0:
+            if np.random.rand() < 0.4 and num_augmentations > 0:
                 augmentations.append(Gain(p=1))
                 num_augmentations -= 1
 
             # Mp3Compression
-            if np.random.rand() < 0.3 and num_augmentations > 0:
+            if np.random.rand() < 0.4 and num_augmentations > 0:
                 augmentations.append(Mp3Compression(
                     min_bitrate=16,
                     max_bitrate=96,
@@ -122,7 +122,7 @@ class MyDataset(data.Dataset):
                 num_augmentations -= 1
 
             # Pitch shift
-            if np.random.rand() < 0.18 and num_augmentations > 0:
+            if np.random.rand() < 0.2 and num_augmentations > 0:
                 min_semitones_rand = -4
                 max_semitones_rand = 4
                 augmentations.append(PitchShift(min_semitones=min_semitones_rand,
@@ -131,19 +131,19 @@ class MyDataset(data.Dataset):
                 num_augmentations -= 1
 
             # Loudness Normalization
-            if np.random.rand() < 0.3 and num_augmentations > 0:
+            if np.random.rand() < 0.35 and num_augmentations > 0:
                 augmentations.append(LoudnessNormalization(p=1))
                 num_augmentations -= 1
 
         augs = Compose(augmentations)
 
         audio = augs(audio, sample_rate=sample_rate)
-        audio = self.add_noise_and_reverb(audio, sample_rate)
+        audio = self.add_noise_and_reverb(audio, sample_rate, add_gauss=add_gauss)
 
         return audio
 
     def add_noise_and_reverb(self, audio, sample_rate=16000, add_gauss=True):
-        if random.random() < 0.15 and self.rir_folder is not None:
+        if random.random() < 0.3 and self.rir_folder is not None:
             transform_impulse_response = ApplyImpulseResponse(
                 ir_path=self.rir_folder, p=1)
 
@@ -198,11 +198,11 @@ class MyDataset(data.Dataset):
         if sr != self.sampling_rate:
             audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
 
-        if self.noise_files:
-            audio = self.add_bg_noise(audio, min_coef=0.2, max_coef=0.45, p=0.7)
+        if self.noise_files and self.augs_enable:
+            audio = self.add_bg_noise(audio, min_coef=0.15, max_coef=0.4, p=0.9)
 
         if self.is_train and self.augs_enable:
-            audio = self.add_augmentations(audio, self.sampling_rate)
+            audio = self.add_augmentations(audio, self.sampling_rate, add_gauss=False)
 
         encoded_ids = self.tokenizer.encode(file["text"], out_type=int)
         encoded_ids = [el for el in encoded_ids if
