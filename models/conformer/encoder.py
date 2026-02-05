@@ -4,8 +4,8 @@ import math
 
 from models.common_modules.regularization import DropPath
 from models.common_modules.transformer_modules import SwiGLUFFN, GQASelfAttentionRelPos
-from models.conformer_plus_mamba.conv_module import ConvModule
-from models.conformer_plus_mamba.mamba import Mamba2, Mamba2Config
+from models.conformer.conv_module import ConvModule
+from models.common_modules.mamba import Mamba2, Mamba2Config
 from utils.masking import get_mask_vector, cut_masks_with_len_vector, fix_full_masked_lines
 
 # from conv_module import ConvModule

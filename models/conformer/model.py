@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 
 from models.common_modules.regularization import SpecAugment
-from models.conformer_plus_mamba.encoder import AudioEncoder
-from models.conformer_plus_mamba.feature_extractor import FeaturesExractor
+from models.conformer.encoder import AudioEncoder
+from models.common_modules.feature_extractor import FeaturesExractor
 from utils.decoding import ctc_greedy_decode_batch
 
 # from encoder import AudioEncoder
@@ -187,7 +187,15 @@ class ConformerHybrid(nn.Module):
         rnnt_logits = self.rnnt_classifier(enc_out, dec_out)
 
         return ctc_logits, rnnt_logits
-    
+
+    def run_encoder(self, x, audio_len):
+        # [B, C, T, F]
+        x = self.features_extractor(x)
+        x = self.spec_aug(x, audio_len)
+        x = self.downsample_conv(x)
+        enc_out = self.encoder(x, audio_len)
+        return enc_out
+
     def infer_ctc(self, x, audio_len=None, blank_token_id=1024):
         # [B, C, T, F]
         x = self.features_extractor(x)
