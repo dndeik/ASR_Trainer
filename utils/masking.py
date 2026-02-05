@@ -22,7 +22,7 @@ def get_mask_cycle(chunk_size, mask_length, left_context=0, right_context=0):
         mask[row_start:row_end, col_start:col_end] = 1.0
 
     # обрезаем до реальной длины
-    mask = mask[:mask_length, :mask_length]
+    mask = mask[:mask_length, left_context:left_context + mask_length]
 
     # переводим в attention mask
     mask = ~mask.bool()
@@ -56,7 +56,7 @@ def get_mask_vector(chunk_size, mask_length, left_context=0, right_context=0, de
     # 6. Обрезаем до реальной длины
     chunk_mask = chunk_mask[
         :mask_length,
-        :mask_length
+        left_context:left_context + mask_length
     ]  # [mask_length, mask_length]
 
     # 7. Attention mask
