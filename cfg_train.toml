@@ -5,20 +5,20 @@
 devices = "0"   # number of available gpus
 
 [optimizer]
-lr = 0.0001
+lr = 3.5e-5
 
 [model]
 encoder_d_model = 640
-predictor_d_model = 640
+predictor_d_model = 512
 joiner_d_model = 640
 layer_num = 18
-n_heads = 10
-n_groups = 5
-chunk_size = 70
+n_heads = 20
+n_groups = 10
+chunk_size = 72
 left_context_chunk_number = 4
-right_context_chunk_number = 0.5
+right_context_chunk_number = 0
 mamba_every_n_block = -1  # if you don't want to use mamba, set -1
-time_factor = 5
+time_factor = 4
 n_mel = 80
 
 [tokenizer]
@@ -58,24 +58,30 @@ pin_memory = true
 [augmentations]
 augs_enable = true
 min_augs = 1
-max_augs = 2
-noise_folder = "./noise_subset"
-rir_folder = "./rir_room_16kHZ"
-
+max_augs = 3
+noise_folder = "<folder path>"
+rir_folder = "<folder_path>"
 
 [logger]
-log_to_clearml = false
+log_to_clearml = true
+
+[init_weights]
+checkpoint_path = "experiments/RU_18_layer_model_GQA_Squeezeformer_|_New_tokenizer_(800_tokens)_|_2_layer_512_pred_2026-02-13-13h16m/checkpoints/model_0001.tar"
+#checkpoint_path = ""
+strict = true
 
 [trainer]
-epochs = 15
+epochs = 30
+warm_up_steps = 2500
+epoch_when_enable_aug = 0
 save_checkpoint_interval = 1
 train_with_amp = true
-grad_accum = 8
+grad_accum = 3
 validation_interval = 1
-clip_grad_norm_value = 3.0
-exp_path = "experiments/gqa_with_mamba"
-resume = false
-resume_checkpoint_path = ''
-resume_datetime = '2025-11-19-23h43m'
-resume_step = 0
+clip_grad_norm_value = 50.0
 
+[experiment]
+experiments_path = "experiments"
+exp_name = "RU 18 layer model GQA Squeezeformer | New tokenizer (800 tokens) | 2 layer 512 pred | Full train"
+resume = false
+resume_from_folder = "experiments/RU_18_layer_model_GQA_Squeezeformer_no_Augs_untill_half_train_2026-02-11-11h53m"

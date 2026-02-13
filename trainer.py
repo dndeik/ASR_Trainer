@@ -1,4 +1,7 @@
 import os
+import time
+import random
+import numpy as np
 import torch
 import torchaudio
 import toml
@@ -13,14 +16,24 @@ from utils.decoding import rnnt_greedy_decode_batch, ctc_greedy_decode_batch
 from datasets import BLANK_TOKEN_ID
 
 
+def set_seed(seed):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
 class Trainer:
     def __init__(self, config, model, tokenizer, optimizer,
                  train_dataloader, validation_dataloader, train_sampler, args):
-        
+        set_seed(time.time_ns() % 10 ** 6)
+
         self.rank = args.rank
         self.device = args.device
         self.world_size = args.world_size
-    
+
         self.config = config
         self.model = model
         self.tokenizer = tokenizer
@@ -30,12 +43,13 @@ class Trainer:
 
         self.ctc_loss = torch.nn.modules.CTCLoss(blank=BLANK_TOKEN_ID, zero_infinity=True).to(self.device)
         self.rnnt_loss = torchaudio.functional.rnnt_loss
-        self.ctc_weight = 0.3
+        self.ctc_weight = 0.35
 
         self.time_factor = config["model"]["time_factor"]
         self.accum_step = config["trainer"]["grad_accum"]
 
-        t0 = 1500 / int(len(train_dataloader) * config["trainer"]["epochs"] // self.accum_step)
+        t0 = config["trainer"]["warm_up_steps"] / int(
+            len(train_dataloader) * config["trainer"]["epochs"] // self.accum_step)
         self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=config["optimizer"]["lr"],
                                                              div_factor=200, pct_start=t0, anneal_strategy='cos',
                                                              steps_per_epoch=len(train_dataloader) // self.accum_step,
@@ -51,14 +65,23 @@ class Trainer:
         self.save_checkpoint_interval = self.trainer_config['save_checkpoint_interval']
         self.validation_interval = self.trainer_config['validation_interval']
         self.clip_grad_norm_value = self.trainer_config['clip_grad_norm_value']
-        self.resume = self.trainer_config['resume']
-        self.resume_checkpoint_path = self.trainer_config['resume_checkpoint_path']
+
+        # experiment config
+        self.exp_config = config['experiment']
+        self.exp_root_folder = self.exp_config['experiments_path']
+        self.exp_name = self.exp_config['exp_name']
+        self.resume = self.exp_config['resume']
+        self.resume_from_folder = self.exp_config['resume_from_folder']
 
         if not self.resume:
-            self.exp_path = self.trainer_config['exp_path'] + '_' + datetime.now().strftime("%Y-%m-%d-%Hh%Mm")
+            self.exp_path = os.path.join(self.exp_root_folder,
+                                         '_'.join(self.exp_name.split()) + '_' + datetime.now().strftime(
+                                             "%Y-%m-%d-%Hh%Mm"))
             self._save_model_info()
+        elif self.resume_from_folder:
+            self.exp_path = self.resume_from_folder
         else:
-            self.exp_path = self.trainer_config['exp_path'] + '_' + self.trainer_config['resume_datetime']
+            raise RuntimeError("Set way to resume train")
 
         self.log_path = os.path.join(self.exp_path, 'logs')
         self.checkpoint_path = os.path.join(self.exp_path, 'checkpoints')
@@ -69,9 +92,7 @@ class Trainer:
         os.makedirs(self.sample_path, exist_ok=True)
 
         # save the config
-        with open(
-                os.path.join(
-                    self.exp_path, 'config.toml'.format(datetime.now().strftime("%Y-%m-%d-%Hh%Mm"))), 'w') as f:
+        with open(os.path.join(self.exp_path, 'config.toml'), 'w') as f:
             toml.dump(config, f)
 
         self.writer = SummaryWriter(self.log_path)
@@ -79,14 +100,22 @@ class Trainer:
         if config["logger"]["log_to_clearml"]:
             from clearml import Logger
             self.clearml_logger = Logger.current_logger()
+            self._save_clearml_info_to_file()
 
         self.start_epoch = 0
         self.best_score = 0
 
+        self.aug_start_epoch = config["trainer"]["epoch_when_enable_aug"]
+
         if self.resume:
             self._resume_checkpoint()
 
-        self.sr = config['listener']['listener_sr']
+    def _save_clearml_info_to_file(self):
+        from clearml import Task
+        task_id = Task.current_task().id
+        with open(os.path.join(self.exp_path, 'clearml_info.txt'), "w", encoding="utf-8") as f:
+            f.write(self.exp_name + "\n")
+            f.write(task_id)
 
     def _save_model_info(self):
         os.makedirs(self.exp_path, exist_ok=True)
@@ -127,10 +156,7 @@ class Trainer:
             print(f'New best models saved on {epoch} epoch.')
 
     def _resume_checkpoint(self):
-        if self.resume_checkpoint_path != '':
-            latest_checkpoints = self.resume_checkpoint_path
-        else:
-            latest_checkpoints = sorted(glob(os.path.join(self.checkpoint_path, 'model_*.tar')))[-1]
+        latest_checkpoints = sorted(glob(os.path.join(self.checkpoint_path, 'model_*.tar')))[-1]
 
         map_location = self.device
         checkpoint = torch.load(latest_checkpoints, map_location=map_location)
@@ -148,12 +174,12 @@ class Trainer:
         if self.world_size > 1:
             self.model.module.load_state_dict(checkpoint['model'])
         else:
-            self.model.load_state_dict(checkpoint['model'])
+            self.model.load_state_dict(checkpoint['model'], strict=True)
 
     def _calculate_wer(self, esti: torch.Tensor, target: torch.Tensor, type: str = "rnnt"):
         blank_token = BLANK_TOKEN_ID
 
-        if type == "ctc":       
+        if type == "ctc":
             esti = esti.transpose(0, 1)
             esti = torch.argmax(esti, dim=-1).detach().int()
             batch_decoded = ctc_greedy_decode_batch(esti, blank=blank_token)
@@ -172,6 +198,9 @@ class Trainer:
         norm_esti_list = werpy.normalize(esti_list)
         norm_target_list = werpy.normalize(target_list)
 
+        norm_esti_list = [el.replace("¿", "").replace("¡", "").strip() for el in norm_esti_list]
+        norm_target_list = [el.replace("¿", "").replace("¡", "").strip() for el in norm_target_list]
+
         wer = werpy.wer(norm_target_list, norm_esti_list)
 
         wer = wer if wer is not None else 1.
@@ -179,11 +208,12 @@ class Trainer:
         return wer, esti_list, target_list
 
     def _model_invoke(self, audio, audio_len, target, target_len):
-        target = torch.cat([torch.full((target.shape[0], 1), fill_value=BLANK_TOKEN_ID, device=target.device), target], dim=-1)
-        ctc_out, rnnt_out = self.model(audio, audio_len, target, target_len+1)
+        target = torch.cat([torch.full((target.shape[0], 1), fill_value=BLANK_TOKEN_ID, device=target.device), target],
+                           dim=-1)
+        ctc_out, rnnt_out = self.model(audio, audio_len, target, target_len + 1)
         ctc_out = ctc_out.transpose(0, 1)
         return ctc_out, rnnt_out
-    
+
     def _calculate_loss(self, ctc_logits, rnnt_logits, targets, x_lengths, target_lengths):
         targets = targets.to(torch.int32)
         x_lengths = x_lengths.to(torch.int32)
@@ -254,11 +284,6 @@ class Trainer:
             total_rnnt_loss += cur_rnnt_loss
             accum_rnnt_loss += cur_rnnt_loss
 
-            train_bar.desc = '   train[{}/{}][{}]'.format(
-                epoch, self.epochs, datetime.now().strftime("%Y-%m-%d-%H:%M"))
-
-            train_bar.postfix = 'train_loss={:.2f}, step={}'.format(total_loss / step, step // self.accum_step)
-
             loss = loss / self.accum_step
 
             if self.train_with_amp:
@@ -266,29 +291,38 @@ class Trainer:
             else:
                 loss.backward()
 
+            real_step = (epoch * len(self.train_dataloader) + step) / self.accum_step
             if step % self.accum_step == 0:
                 if self.train_with_amp:
                     self.scaler.unscale_(self.optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
+                    cur_gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
+                    cur_gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
+
                     self.optimizer.step()
 
                 self.optimizer.zero_grad()
                 self.scheduler.step()
 
-            batch_wer, esti_text, target_text = self._calculate_wer(ctc_out, target, type="ctc")
+                self.writer.add_scalars('Grad norm', {'grad_norm': cur_gn}, real_step)
+
+            wer_type = "ctc"
+            batch_wer, esti_text, target_text = self._calculate_wer(ctc_out, target, type=wer_type)
             total_wer += batch_wer
             accum_wer += batch_wer
+
+            train_bar.desc = '   train[{}/{}][{}]'.format(
+                epoch, self.epochs, datetime.now().strftime("%Y-%m-%d-%H:%M"))
+
+            train_bar.postfix = f'train_loss={total_loss / step:.2f}, wer({wer_type})={total_wer / step:.3f}, step={step // self.accum_step}'
 
             log_step = self.accum_step
             if step % log_step == 0 and self.rank == 0:
                 print()
                 print("REF: ", target_text[0])
                 print("EST: ", esti_text[0])
-                real_step = (epoch * len(self.train_dataloader) + step) / self.accum_step
                 self.writer.add_scalars('LR', {'lr': self.optimizer.param_groups[0]['lr']},
                                         real_step)
                 self.writer.add_scalars('Monitoring', {'total_loss': accum_loss / log_step,
@@ -321,11 +355,11 @@ class Trainer:
         validation_bar = tqdm(self.validation_dataloader, ncols=160)
         for step, (audio, audio_len, target, target_len) in enumerate(validation_bar, 1):
             audio = audio.to(self.device)
-            audio_len = audio_len.to(self.device).long() 
-            corrected_audio_len = audio_len // self.time_factor # TODO: некрасиво
-            corrected_audio_len = corrected_audio_len.long() 
-            target = target.to(self.device).long() 
-            target_len = target_len.to(self.device).long() 
+            audio_len = audio_len.to(self.device).long()
+            corrected_audio_len = audio_len // self.time_factor  # TODO: некрасиво
+            corrected_audio_len = corrected_audio_len.long()
+            target = target.to(self.device).long()
+            target_len = target_len.to(self.device).long()
 
             ctc_out, rnnt_out = self._model_invoke(audio, corrected_audio_len, target, target_len)
             loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
@@ -336,14 +370,17 @@ class Trainer:
             batch_rnnt_wer, esti_text, target_text = self._calculate_wer(rnnt_out, target, type="rnnt")
             total_rnnt_wer += batch_rnnt_wer
 
+            print()
+            print("REF: ", target_text[0])
+            print("EST: ", esti_text[0])
+
             batch_ctc_wer, esti_text, target_text = self._calculate_wer(ctc_out, target, type="ctc")
             total_ctc_wer += batch_ctc_wer
 
             validation_bar.desc = 'validate[{}/{}][{}]'.format(
                 epoch, self.epochs, datetime.now().strftime("%Y-%m-%d-%H:%M"))
 
-            validation_bar.postfix = 'valid_loss={:.2f}, valid_ctc_wer={:.2f}, valid_rnnt_wer={:.2f}'.format(
-                total_loss / step, total_ctc_wer / step, total_rnnt_wer / step)
+            validation_bar.postfix = f'valid_loss={total_loss / step:.2f}, valid_ctc_wer={total_ctc_wer / step:.2f}, valid_rnnt_wer={total_rnnt_wer / step:.2f}'
 
         if (self.world_size > 1) and (self.device != torch.device("cpu")):
             torch.cuda.synchronize(self.device)
@@ -361,12 +398,23 @@ class Trainer:
         if self.resume:
             self._resume_checkpoint()
 
-        for epoch in range(self.start_epoch, self.epochs + self.start_epoch):
-            if self.train_sampler is not None:
-                self.train_sampler.set_epoch(epoch)
+        for epoch in range(self.start_epoch, self.epochs):
+            # if self.train_sampler is not None:
+            #     self.train_sampler.set_epoch(epoch)
 
+            if epoch >= self.aug_start_epoch:
+                self.train_dataloader.dataset.augs_enable = True
+                print("Augs enabled")
+            else:
+                self.train_dataloader.dataset.augs_enable = False
+                print("Augs disabled")
+
+            set_seed(time.time_ns() % 10 ** 6)
             self._set_train_mode()
             self._train_epoch(epoch)
+
+            if (self.rank == 0) and (epoch % self.save_checkpoint_interval == 0):
+                self._save_checkpoint(epoch, 10000)
 
             self._set_eval_mode()
             if epoch % self.validation_interval == 0:

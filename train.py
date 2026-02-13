@@ -2,24 +2,13 @@ import os
 import json
 import toml
 import torch
-import random
 import argparse
-import numpy as np
 import torch.distributed as dist
 import sentencepiece as spm
 
 from trainer import Trainer
-from models.conformer_plus_mamba.model import ConformerHybrid, count_parameters
+from models.squeezeformer.model import ConformerHybrid, count_parameters
 from datasets import MyDataset, BucketingSampler, custom_collate_fn
-
-
-# seed = 4956
-# random.seed(seed)
-# os.environ['PYTHONHASHSEED'] = str(seed)
-# np.random.seed(seed)
-# torch.manual_seed(seed)
-# torch.cuda.manual_seed(seed)
-# torch.cuda.manual_seed_all(seed)
 
 
 # torch.backends.cudnn.deterministic =True
@@ -42,7 +31,8 @@ def run(rank, config, args):
 
     train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], **config['FFT'], is_train=True)
     train_dataset.set_augmentations(**config["augmentations"])
-    train_sampler = BucketingSampler(train_dataset.get_audio_lens(), config["train_dataloader"]["batch_size"])
+    train_sampler = BucketingSampler(train_dataset.get_audio_lens(), config["train_dataloader"]["batch_size"],
+                                     bucket_size=600)
     train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_sampler=train_sampler,
                                                    pin_memory=config['train_dataloader']['pin_memory'],
                                                    num_workers=config['train_dataloader']['num_workers'],
@@ -55,7 +45,7 @@ def run(rank, config, args):
                                                         **config['validation_dataloader'], shuffle=False,
                                                         collate_fn=custom_collate_fn)
 
-    model = ConformerHybrid(num_vocab=tokenizer.vocab_size()+1,
+    model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1,
                             encoder_d_model=config['model']['encoder_d_model'],
                             predictor_d_model=config['model']['predictor_d_model'],
                             joiner_d_model=config['model']['joiner_d_model'],
@@ -64,17 +54,19 @@ def run(rank, config, args):
                             chunk_size=config['model']['chunk_size'],
                             left_context_chunk_number=config['model']['left_context_chunk_number'],
                             right_context_chunk_number=config['model']['right_context_chunk_number'],
-                            freq_dim=config['FFT']['hop_length']+1,
+                            freq_dim=config['FFT']['hop_length'] + 1,
                             n_heads=config['model']['n_heads'],
                             n_groups=config['model']['n_groups'],
                             layer_num=config['model']['layer_num'],
                             mamba_every_n_block=config['model']['mamba_every_n_block'],
-                            dropout=0.15)
+                            dropout=0.1)
 
-    # ckpt = torch.load("experiments/gqa_with_mamba_FIXED_2025-11-19-14h35m/checkpoints/model_0001.tar", weights_only=False)
-    # ckpt = ckpt["model"]
-    # model.load_state_dict(ckpt, strict=True)
-    # print("Weight loaded")
+    if config["init_weights"]["checkpoint_path"]:
+        ckpt = torch.load(config["init_weights"]["checkpoint_path"], map_location="cpu", weights_only=False)
+        ckpt = ckpt["model"]
+
+        model.load_state_dict(ckpt, strict=config["init_weights"]["strict"])
+        print("Weight loaded")
 
     count_parameters(model)
     model.to(args.device)
@@ -82,7 +74,8 @@ def run(rank, config, args):
     if args.world_size > 1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['optimizer']['lr'], weight_decay=0.05)
+    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['optimizer']['lr'], weight_decay=0.01,
+                                  betas=(0.9, 0.998))
 
     trainer = Trainer(config=config, model=model, tokenizer=tokenizer, optimizer=optimizer,
                       train_dataloader=train_dataloader, validation_dataloader=validation_dataloader,
@@ -106,7 +99,16 @@ if __name__ == '__main__':
 
     if config["logger"]["log_to_clearml"]:
         from clearml import Task
-        task = Task.init(project_name='ASR', task_name="Big GQA combo with mamba") #, continue_last_task='<task_id>')
+
+        if config["experiment"]["resume"]:
+            with open(os.path.join(config["experiment"]["resume_from_folder"], "clearml_info.txt"), "r") as f:
+                data = f.readlines()
+            task_name = data[0]
+            continue_task = data[1]
+        else:
+            task_name = config["experiment"]["exp_name"]
+            continue_task = False
+        task = Task.init(project_name='ASR', task_name=task_name, continue_last_task=continue_task)
         task.upload_artifact(name='config', artifact_object=config)
 
     if args.world_size > 1:
