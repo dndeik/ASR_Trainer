@@ -149,7 +149,7 @@ class ConformerHybrid(nn.Module):
         super().__init__()
         # Encoder part
         downsampled_chunk_size = chunk_size // time_factor
-        self.features_extractor = FeaturesExractor(freq_dim, n_mel, chunk_size=chunk_size, eps=GLOBAL_EPS)
+        self.features_extractor = FeaturesExractor(freq_dim, n_mel, chunk_size=chunk_size)
         self.spec_aug = SpecAugment(0.05, 0.06, 5, 6)
         self.downsample_conv = DownsampleConv(n_mel, encoder_d_model, k_size=time_factor * 2 + 1, stride=time_factor)
         self.encoder = AudioEncoder(encoder_d_model, downsampled_chunk_size, left_context_chunk_number, right_context_chunk_number, n_heads, n_groups, layer_num, mamba_every_n_block, dropout)

@@ -136,11 +136,9 @@ class FeaturesExractor(nn.Module):
         n_mel: int,
         chunk_size: int = 32,
         trainable_mel: bool = True,
-        eps: float = 1e-5,
     ):
         super().__init__()
         self.chunk_size = chunk_size
-        self.eps = eps
 
         self.mel = self._get_trainable_mel(freq_dim, n_mel, trainable=trainable_mel)
 
@@ -161,29 +159,10 @@ class FeaturesExractor(nn.Module):
         out: [B, T, n_mel]
         """
         x = torch.sqrt(x[:, 0, ...] ** 2 + x[:, 1, ...] ** 2)  # mag [B, T, F]
-        x = torch.pow(x + self.eps, 0.5) # power compression
+        x = torch.pow(x, 0.5)  # power compression
         x = self.mel(x)
 
         return x
-    
-    def infer_chunk(
-        self,
-        x: torch.Tensor,          # [B, C, F]
-        mu: torch.Tensor,               # [F]
-        var: torch.Tensor,              # [F]
-        overlap: torch.Tensor | None,   # [B, O, F] or None
-    ):
-        """
-        input: [B, C, chunk_size, F]
-        out: [B, chunk_size, n_mel]
-        """
-        assert x.shape[-2] == self.chunk_size
-        x = torch.sqrt(x[:, 0, ...] ** 2 + x[:, 1, ...] ** 2)  # mag [B, T, F]
-        x = torch.pow(x + self.eps, 0.5) # power compression
-        x = self.mel(x)
-        x, mu, var, overlap = self.cmvn(x, mu, var, overlap)
-
-        return x, mu, var, overlap
 
 
 if __name__ == "__main__":
