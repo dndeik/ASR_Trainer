@@ -12,7 +12,7 @@ from utils.masking import get_mask_vector, cut_masks_with_len_vector, fix_full_m
 # from conv_module import ConvModule, CausalConv1d
 # from mamba import Mamba2, Mamba2Config
 
-GLOBAL_EPS = 1e-4
+GLOBAL_EPS = 1e-5
 
 
 class Scaler(nn.Module):
@@ -26,7 +26,8 @@ class Scaler(nn.Module):
 
 
 class BaseEncoderBlock(nn.Module):
-    def __init__(self, type: str, d_model, n_heads, n_groups, chunk_size, left_context, right_context=0, conv_kernel=9, dropout=0.):
+    def __init__(self, type: str, d_model, n_heads, n_groups, chunk_size, left_context, right_context=0, conv_kernel=9,
+                 dropout=0.):
         super().__init__()
         self.chunk_size = chunk_size
         self.left_context = left_context
@@ -34,26 +35,28 @@ class BaseEncoderBlock(nn.Module):
         self.n_heads = n_heads
         assert type in ['attn', 'mamba'], "Type must be 'attn' or 'mamba'"
         self.type = type
-        max_rel_pos = math.ceil((self.chunk_size + self.left_context + self.right_context) / self.chunk_size) * self.chunk_size
+        max_rel_pos = math.ceil(
+            (self.chunk_size + self.left_context + self.right_context) / self.chunk_size) * self.chunk_size
 
-        # self.pre_attn_scaler = Scaler(d_model)
         if self.type == 'attn':
-            self.block = GQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_groups, max_position=max_rel_pos, bias=False, dropout=dropout,)
+            self.block = GQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_groups,
+                                                max_position=max_rel_pos, bias=False, dropout=dropout, )
         elif self.type == 'mamba':
             self.block = Mamba2(Mamba2Config(d_model=d_model, chunk_size=chunk_size, expand=1))
         self.attn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
+        self.attn_coef = nn.Parameter(torch.ones(1))
 
-        # self.pre_first_ffn_scaler = Scaler(d_model)
         self.first_ffn = SwiGLUFFN(d_model, factor=2)
         self.first_ffn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
+        self.first_ffn_coef = nn.Parameter(torch.ones(1))
 
-        # self.pre_conv_block_scaler = Scaler(d_model)
         self.conv_block = ConvModule(d_model, conv_kernel, dropout=dropout)
         self.conv_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
+        self.conv_coef = nn.Parameter(torch.ones(1))
 
-        # self.pre_sec_ffn_scaler = Scaler(d_model)
         self.sec_ffn = SwiGLUFFN(d_model, factor=2)
         self.sec_ffn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
+        self.sec_ffn_coef = nn.Parameter(torch.ones(1))
 
         self.drop_block = DropPath(dropout)
 
@@ -61,37 +64,34 @@ class BaseEncoderBlock(nn.Module):
         B, L, D = x.shape
 
         residual = x
-        # x = self.pre_first_ffn_scaler(x)
         x = self.first_ffn_norm(x)
-        x = residual + self.drop_block(self.first_ffn(x))
-        
+        x = residual + self.drop_block(self.first_ffn_coef * self.first_ffn(x))
+
         residual = x
-        # x = self.pre_attn_scaler(x)
         x = self.attn_norm(x)
         if self.type == 'attn':
             padded_x = torch.cat((torch.zeros((B, self.left_context, D), device=x.device, dtype=x.dtype), x), dim=1)
             x = self.block(padded_x, attn_mask=attn_mask)[:, self.left_context:, :]
         else:
-            pad_len = (x.shape[1] + self.chunk_size-1) // self.chunk_size * self.chunk_size - x.shape[1]
+            pad_len = (x.shape[1] + self.chunk_size - 1) // self.chunk_size * self.chunk_size - x.shape[1]
             padded_x = torch.cat((x, torch.zeros((B, pad_len, D), device=x.device, dtype=x.dtype)), dim=1)
             x = self.block(padded_x)[0][:, :L, :]
-        x = residual + self.drop_block(x)
-        
+        x = residual + self.drop_block(self.attn_coef * x)
+
         residual = x
         x = self.conv_norm(x)
-        # x = self.pre_conv_block_scaler(x)
-        x = residual + self.drop_block(self.conv_block(x))
+        x = residual + self.drop_block(self.conv_coef * self.conv_block(x))
 
         residual = x
         x = self.sec_ffn_norm(x)
-        # x = self.pre_sec_ffn_scaler(x)
-        x = x + self.drop_block(self.sec_ffn(x))
+        x = x + self.drop_block(self.sec_ffn_coef * self.sec_ffn(x))
 
         return x
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, inter_d_model, chunk_size, left_context_chunk_number, right_context_chunk_number, n_heads, n_groups, conv_kernel=9, layer_num=1, mamba_every_n_block=3, dropout=0.1):
+    def __init__(self, inter_d_model, chunk_size, left_context_chunk_number, right_context_chunk_number, n_heads,
+                 n_groups, conv_kernel=9, layer_num=1, mamba_every_n_block=3, dropout=0.1):
         super().__init__()
         self.n_heads = n_heads
         self.dropout = dropout
@@ -112,24 +112,34 @@ class AudioEncoder(nn.Module):
         self.downsampled_blocks = nn.ModuleList()
         self.end_full_blocks = nn.ModuleList()
         for i in range(layer_num):
-            block_type = "mamba" if (i+1) % mamba_every_n_block == 0 and use_mamba else "attn"
+            block_type = "mamba" if (i + 1) % mamba_every_n_block == 0 and use_mamba else "attn"
 
             if i >= first_downscaled_block and i <= last_downscaled_block:
-                self.downsampled_blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size // self.downsample_factor, self.left_context // self.downsample_factor, self.right_context // self.downsample_factor, conv_kernel // self.downsample_factor + conv_kernel % 2, dropout))
+                self.downsampled_blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups,
+                                                                self.chunk_size // self.downsample_factor,
+                                                                self.left_context // self.downsample_factor,
+                                                                self.right_context // self.downsample_factor,
+                                                                conv_kernel // self.downsample_factor + conv_kernel % 2,
+                                                                dropout))
             elif i < first_downscaled_block:
-                self.start_full_blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context, self.right_context, conv_kernel, dropout))
+                self.start_full_blocks.append(
+                    BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context,
+                                     self.right_context, conv_kernel, dropout))
             else:
-                self.end_full_blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context, self.right_context, conv_kernel, dropout))
+                self.end_full_blocks.append(
+                    BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context,
+                                     self.right_context, conv_kernel, dropout))
 
-        self.downsample_conv = CausalConv1d(inter_d_model, inter_d_model, self.downsample_factor + 1, stride=self.downsample_factor)
+        self.downsample_conv = CausalConv1d(inter_d_model, inter_d_model, self.downsample_factor + 1,
+                                            stride=self.downsample_factor)
 
     def _get_finished_mask(self, x, audio_len=None, downsample_factor=1):
         B, L, D = x.shape
         mask = get_mask_vector(self.chunk_size // downsample_factor,
-                                (L + self.left_context) // downsample_factor,
-                                self.left_context // downsample_factor,
-                                self.right_context // downsample_factor,
-                                device=x.device)
+                               (L + self.left_context) // downsample_factor,
+                               self.left_context // downsample_factor,
+                               self.right_context // downsample_factor,
+                               device=x.device)
 
         if audio_len is not None:
             audio_len = audio_len // downsample_factor
@@ -146,7 +156,7 @@ class AudioEncoder(nn.Module):
 
         for module in self.start_full_blocks:
             x = module(x, full_blocks_masks)
-        
+
         residual = x
         src_len = x.shape[1]
         x = x.transpose(1, 2)
@@ -154,7 +164,7 @@ class AudioEncoder(nn.Module):
         x = x.transpose(1, 2)
         for module in self.downsampled_blocks:
             x = module(x, downsampled_blocks_masks)
-        
+
         x = x.transpose(1, 2)
         x = F.interpolate(x, size=src_len, mode="nearest")
         x = x.transpose(1, 2)
@@ -178,7 +188,7 @@ if __name__ == "__main__":
     n_heads = 8
     layer_num = 10
     dropout = 0.1
-    model = AudioEncoder(inter_d_model, chunk_size, 3, 0.5, n_heads, n_heads//2, 9, layer_num, -1, dropout).eval()
+    model = AudioEncoder(inter_d_model, chunk_size, 3, 0.5, n_heads, n_heads // 2, 9, layer_num, -1, dropout).eval()
     count_parameters(model)
 
     x = torch.randn(3, 400, inter_d_model)
