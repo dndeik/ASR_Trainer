@@ -81,10 +81,13 @@ class ConformerHybrid(nn.Module):
                  layer_num=8, mamba_every_n_block=3, dropout=0.1):
         super().__init__()
         # Encoder part
-        downsampled_chunk_size = chunk_size // time_factor
+        self.time_factor = time_factor
+        self.first_conv_kernel = self.time_factor * 2 + 1
+        downsampled_chunk_size = chunk_size // self.time_factor
+
         self.features_extractor = FeaturesExractor(freq_dim, n_mel, chunk_size=chunk_size)
         self.spec_aug = SpecAugment(0.10, 0.05, 5, 3)
-        self.downsample_conv = TransposedConv(n_mel, encoder_d_model, k_size=time_factor * 2 + 1, stride=time_factor)
+        self.downsample_conv = TransposedConv(n_mel, encoder_d_model, k_size=self.first_conv_kernel, stride=self.time_factor)
         self.encoder = AudioEncoder(encoder_d_model, downsampled_chunk_size, left_context_chunk_number,
                                     right_context_chunk_number, n_heads, n_groups, 9, layer_num, mamba_every_n_block,
                                     dropout)
@@ -105,41 +108,45 @@ class ConformerHybrid(nn.Module):
 
     def forward(self, x, audio_len, targets, targets_len):
         # [B, C, T, F]
-        x = self.features_extractor(x)
-        x = self.spec_aug(x, audio_len)
-        x = self.downsample_conv(x)
-        enc_out = self.encoder(x, audio_len)
+        enc_out, corrected_len = self.run_encoder(x, audio_len)
 
         # CTC head
-        ctc_logits = self.ctc_conv(enc_out)
-        ctc_logits = self.dropout(ctc_logits)
-        ctc_logits = self.ctc_classifier(ctc_logits)
+        ctc_logits = self.run_ctc_head(enc_out)
 
         # RNNT head
         dec_out = self.rnnt_decoder(targets, targets_len)
         rnnt_logits = self.rnnt_classifier(enc_out, dec_out)
 
-        return ctc_logits, rnnt_logits
+        return ctc_logits, rnnt_logits, corrected_len
 
     def run_encoder(self, x, audio_len):
         # [B, C, T, F]
         x = self.features_extractor(x)
         x = self.spec_aug(x, audio_len)
         x = self.downsample_conv(x)
-        enc_out = self.encoder(x, audio_len)
-        return enc_out
+        corrected_lens = self._calculate_correct_lens(audio_len, tensor_len=x.shape[1])
+        enc_out = self.encoder(x, corrected_lens)
+        return enc_out, corrected_lens
+
+    def run_ctc_head(self, enc_out):
+        ctc_logits = self.ctc_conv(enc_out)
+        ctc_logits = self.dropout(ctc_logits)
+        ctc_logits = self.ctc_classifier(ctc_logits)
+        return ctc_logits
+
+    def _calculate_correct_lens(self, audio_len, tensor_len):
+        if audio_len is None:
+            return audio_len
+        corrected_lens = (audio_len + self.first_conv_kernel // 2) // self.time_factor + 1
+        corrected_lens = torch.clamp(corrected_lens, max=tensor_len)
+        return corrected_lens
 
     def infer_ctc(self, x, audio_len=None, blank_token_id=1024):
         # [B, C, T, F]
-        x = self.features_extractor(x)
-        x = self.downsample_conv(x)
-        x = self.encoder(x, audio_len)
-        enc_out = self.post_norm(x)
+        enc_out, _ = self.run_encoder(x, audio_len)
 
         # CTC head
-        ctc_logits = self.ctc_decoder.infer(enc_out)
-        ctc_logits = self.post_ctc_dec_norm(ctc_logits)
-        ctc_logits = self.ctc_classifier(ctc_logits)
+        ctc_logits = self.run_ctc_head(enc_out)
 
         out = ctc_greedy_decode_batch(ctc_logits, blank_token_id)
 
@@ -149,10 +156,7 @@ class ConformerHybrid(nn.Module):
         # [B, C, T, F]
         assert x.shape[0] == 1, "Now only single file supported"
 
-        x = self.features_extractor(x)
-        x = self.downsample_conv(x)
-        x = self.encoder(x, audio_len)
-        enc_out = self.post_norm(x)
+        enc_out, _ = self.run_encoder(x, audio_len)
 
         # RNNT greedy decoding
         dec_out, hidden = self._run_decoder(torch.tensor(blank_token_id))

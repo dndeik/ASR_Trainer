@@ -45,7 +45,6 @@ class Trainer:
         self.rnnt_loss = torchaudio.functional.rnnt_loss
         self.ctc_weight = 0.35
 
-        self.time_factor = config["model"]["time_factor"]
         self.accum_step = config["trainer"]["grad_accum"]
 
         t0 = config["trainer"]["warm_up_steps"] / int(
@@ -210,9 +209,10 @@ class Trainer:
     def _model_invoke(self, audio, audio_len, target, target_len):
         target = torch.cat([torch.full((target.shape[0], 1), fill_value=BLANK_TOKEN_ID, device=target.device), target],
                            dim=-1)
-        ctc_out, rnnt_out = self.model(audio, audio_len, target, target_len + 1)
+        ctc_out, rnnt_out, corrected_audio_len = self.model(audio, audio_len, target, target_len + 1)
+        corrected_audio_len = corrected_audio_len.long()
         ctc_out = ctc_out.transpose(0, 1)
-        return ctc_out, rnnt_out
+        return ctc_out, rnnt_out, corrected_audio_len
 
     def _calculate_loss(self, ctc_logits, rnnt_logits, targets, x_lengths, target_lengths):
         targets = targets.to(torch.int32)
@@ -253,18 +253,16 @@ class Trainer:
         for step, (audio, audio_len, target, target_len) in enumerate(train_bar, 1):
             audio = audio.to(self.device)
             audio_len = audio_len.to(self.device).long()
-            corrected_audio_len = audio_len // self.time_factor  # TODO: некрасиво
-            corrected_audio_len = corrected_audio_len.long()
             target = target.to(self.device).long()
             target_len = target_len.to(self.device).long()
 
             if self.train_with_amp:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                    ctc_out, rnnt_out = self._model_invoke(audio, corrected_audio_len, target, target_len)
+                    ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(audio, audio_len, target, target_len)
                     loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
                                                                      target_len)
             else:
-                ctc_out, rnnt_out = self._model_invoke(audio, corrected_audio_len, target, target_len)
+                ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(audio, audio_len, target, target_len)
                 loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
                                                                  target_len)
 
@@ -356,12 +354,10 @@ class Trainer:
         for step, (audio, audio_len, target, target_len) in enumerate(validation_bar, 1):
             audio = audio.to(self.device)
             audio_len = audio_len.to(self.device).long()
-            corrected_audio_len = audio_len // self.time_factor  # TODO: некрасиво
-            corrected_audio_len = corrected_audio_len.long()
             target = target.to(self.device).long()
             target_len = target_len.to(self.device).long()
 
-            ctc_out, rnnt_out = self._model_invoke(audio, corrected_audio_len, target, target_len)
+            ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(audio, audio_len, target, target_len)
             loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
             total_loss += loss.item()
             total_ctc_loss += ctc_loss.item()
