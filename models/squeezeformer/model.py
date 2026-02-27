@@ -23,11 +23,11 @@ class TransposedConv(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, num_vocab, embed_dim, hidden_dim):
+    def __init__(self, num_vocab, embed_dim, hidden_dim, dropout=0.):
         super().__init__()
         self.embedding = nn.Embedding(num_vocab, embed_dim)
-        self.predictor = nn.LSTM(embed_dim, hidden_dim, bidirectional=False, batch_first=True, num_layers=2,
-                                 dropout=0.05)
+        self.predictor = nn.LSTM(embed_dim, hidden_dim, bidirectional=False, batch_first=True, num_layers=1,
+                                 dropout=dropout)
 
     def forward(self, y, y_lengths):
         emb = self.embedding(y)
@@ -74,7 +74,7 @@ class ConformerHybrid(nn.Module):
     def __init__(self, num_vocab, encoder_d_model,
                  predictor_d_model, joiner_d_model, freq_dim, n_mel, time_factor, n_heads, n_groups, chunk_size,
                  left_context_chunk_number=1, right_context_chunk_number=0,
-                 layer_num=8, mamba_every_n_block=3, dropout=0.1):
+                 layer_num=8, mamba_every_n_block=3, dropout=0.1, drop_path=0.1):
         super().__init__()
         # Encoder part
         self.time_factor = time_factor
@@ -84,7 +84,7 @@ class ConformerHybrid(nn.Module):
         self.downsample_conv = TransposedConv(n_mel, encoder_d_model, k_size=self.first_conv_kernel, stride=self.time_factor)
         self.encoder = AudioEncoder(encoder_d_model, downsampled_chunk_size, left_context_chunk_number,
                                     right_context_chunk_number, n_heads, n_groups, 9, layer_num, mamba_every_n_block,
-                                    dropout)
+                                    dropout, drop_path)
 
         # CTC head
         self.ctc_conv = TransposedConv(encoder_d_model, encoder_d_model, 7)
@@ -94,7 +94,7 @@ class ConformerHybrid(nn.Module):
                                             nn.Linear(2 * encoder_d_model, num_vocab))
 
         # RNNT part
-        self.rnnt_decoder = Decoder(num_vocab, predictor_d_model, predictor_d_model)
+        self.rnnt_decoder = Decoder(num_vocab, predictor_d_model, predictor_d_model, dropout=dropout)
         self.rnnt_classifier = SimpleJoiner(encoder_d_model, predictor_d_model, joiner_d_model, num_vocab,
                                             dropout=dropout)
 
@@ -109,7 +109,7 @@ class ConformerHybrid(nn.Module):
 
         # RNNT head
         dec_out = self.rnnt_decoder(targets, targets_len)
-        rnnt_logits = self.rnnt_classifier(enc_out, dec_out)
+        rnnt_logits = self.rnnt_classifier(self.dropout(enc_out), self.dropout(dec_out))
 
         return ctc_logits, rnnt_logits, corrected_len
 
