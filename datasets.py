@@ -8,7 +8,6 @@ import numpy as np
 import librosa
 from pathlib import Path
 from torch.utils import data
-from torch_stft.stft_implementation.stft import STFT
 
 from audiomentations import Compose, PitchShift, HighPassFilter, LowPassFilter, AddGaussianSNR, ApplyImpulseResponse, \
     AddGaussianNoise, SevenBandParametricEQ, LoudnessNormalization, Gain, Mp3Compression
@@ -17,8 +16,7 @@ BLANK_TOKEN_ID = 1024
 
 
 class MyDataset(data.Dataset):
-    def __init__(self, tokenizer, train_manifest, file_num, min_len, max_len, n_fft=512, hop_length=256,
-                 win_length=512, augs_enable=False, is_train=False):
+    def __init__(self, tokenizer, train_manifest, file_num, min_len, max_len, augs_enable=False, is_train=False):
         super().__init__()
 
         self.final_df = self.get_files_from_manifest(train_manifest)
@@ -30,12 +28,6 @@ class MyDataset(data.Dataset):
         self.max_len = max_len
         self.tokenizer = tokenizer
         self.sampling_rate = 16000
-
-        self.n_fft = n_fft
-        self.hop_length = hop_length
-        self.win_length = win_length
-
-        self.stft = STFT(n_fft=self.n_fft, hop_length=self.hop_length)
 
         self.is_train = is_train
 
@@ -208,10 +200,7 @@ class MyDataset(data.Dataset):
         encoded_ids = [el for el in encoded_ids if
                        el != 0]  # Drop unknown tokens for target, because models must not predict it
 
-        audio = self.stft.transform(torch.from_numpy(audio).float().unsqueeze(0))
-        audio = audio.transpose(1, 3)
-
-        return audio[0], torch.tensor(encoded_ids)
+        return torch.from_numpy(audio), torch.tensor(encoded_ids)
 
     def __len__(self):
         return len(self.final_df)
@@ -264,22 +253,22 @@ def custom_collate_fn(batch):
     audio_len = []
     ids_len = []
     for audio, ids in batch:
-        audio_len.append(audio.shape[-2])
+        audio_len.append(audio.shape[0])
         ids_len.append(ids.shape[-1])
 
     max_audio_len = max(audio_len)
     max_ids_len = max(ids_len)
 
     # Pad sequences to the max_len
-    audio_padding_len = []
+    audio_len = []
     padded_audio = []
 
     ids_len = []
     padded_ids = []
     for audio, ids in batch:
-        time_padding = max_audio_len - audio.shape[-2]
-        padded_item = torch.cat((audio, torch.zeros(audio.shape[0], time_padding, audio.shape[-1], )), dim=1)
-        audio_padding_len.append(audio.shape[-2])
+        time_padding = max_audio_len - audio.shape[0]
+        padded_item = torch.cat((audio, torch.zeros(time_padding)), dim=0)
+        audio_len.append(audio.shape[0])
         padded_audio.append(padded_item)
 
         ids_padding = int(max_ids_len - ids.shape[-1])
@@ -288,4 +277,4 @@ def custom_collate_fn(batch):
         padded_ids.append(padded_item)
 
     # Stack padded sequences and return lengths
-    return torch.stack(padded_audio), torch.tensor(audio_padding_len), torch.stack(padded_ids), torch.tensor(ids_len)
+    return torch.stack(padded_audio), torch.tensor(audio_len), torch.stack(padded_ids), torch.tensor(ids_len)

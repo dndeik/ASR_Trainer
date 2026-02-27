@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torchaudio
 
+from .torch_stft.stft_implementation.stft import STFT
+
 
 class StreamingEMACMVN(nn.Module):
     def __init__(
@@ -131,38 +133,64 @@ class StreamingEMACMVN(nn.Module):
 
 class FeaturesExractor(nn.Module):
     def __init__(
-        self,
-        freq_dim: int,
-        n_mel: int,
-        chunk_size: int = 32,
-        trainable_mel: bool = True,
+            self,
+            n_fft: int,
+            hop_length: int,
+            win_length: int,
+            n_mel: int,
+            eps: float = 1e-6,
+            trainable_mel: bool = False,
     ):
         super().__init__()
-        self.chunk_size = chunk_size
 
-        self.mel = self._get_trainable_mel(freq_dim, n_mel, trainable=trainable_mel)
+        self.eps = eps
+        self.hop_length = hop_length
+        self.win_length = win_length
+        self.stft = STFT(n_fft, self.hop_length, self.win_length)
+        self.mel = self._get_mel(self.hop_length + 1, n_mel, trainable=trainable_mel)
 
-    def _get_trainable_mel(self, freq_dim, n_mel, trainable=True):
+    @staticmethod
+    def _get_mel(freq_dim, n_mel, trainable=True):
         mel_fb = torchaudio.functional.melscale_fbanks(n_freqs=freq_dim, f_min=0, f_max=8000, n_mels=n_mel,
                                                        sample_rate=16000)
         linear = nn.Linear(freq_dim, n_mel, bias=False)
         linear.weight.data = mel_fb.T.data
 
         for p in linear.parameters():
-            p.requires_grad = trainable 
+            p.requires_grad = trainable
 
         return linear
-    
-    def forward(self, x):
-        """
-        input: [B, C, T, F]
-        out: [B, T, n_mel]
-        """
-        x = torch.sqrt(x[:, 0, ...] ** 2 + x[:, 1, ...] ** 2)  # mag [B, T, F]
-        x = torch.pow(x, 0.5)  # power compression
-        x = self.mel(x)
 
-        return x
+    def freeze(self):
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def forward(self, x, audio_len):
+        """
+        input:
+        x [B, L]
+        audio_len [B]
+
+        out:
+        x [B, T, n_mel]
+        audio_len [B]
+        """
+
+        x = self.stft.transform(x)
+        x = x.transpose(1, 3)
+        x = torch.sqrt(x[:, 0, ...] ** 2 + x[:, 1, ...] ** 2)  # mag [B, T, F]
+
+        spec_lens = ((audio_len + 1 * self.hop_length) // self.hop_length)
+        spec_lens = torch.clamp(spec_lens, min=0, max=x.shape[1])
+
+        x = self.mel(x)
+        x = torch.log(x + self.eps)  # log-mel
+
+        # На всякий обнуляем все что выше длины
+        mask = torch.arange(x.size(1), device=x.device)[None, :] < spec_lens[:, None]
+        x.masked_fill_(~mask.unsqueeze(-1), 0.0)
+
+        return x, spec_lens
 
 
 if __name__ == "__main__":
@@ -172,7 +200,7 @@ if __name__ == "__main__":
 
     cmvn = StreamingEMACMVN(f_dim, chunk_size=chunk_size, overlap=0.5)
 
-    dummy_input = torch.rand(bs, chunk_size*10, f_dim)
+    dummy_input = torch.rand(bs, chunk_size * 10, f_dim)
 
     # Full
     full_res = cmvn(dummy_input)
@@ -183,12 +211,12 @@ if __name__ == "__main__":
     print(overlap.shape)
     stream_res = []
     for i in range(0, dummy_input.shape[1], chunk_size):
-        cur_chunk = dummy_input[:, i:i+chunk_size, :]
+        cur_chunk = dummy_input[:, i:i + chunk_size, :]
         norm_chunk, mu, var, overlap = cmvn.infer_chunk(
             cur_chunk, mu, var, overlap
         )
         stream_res.append(norm_chunk)
-    
+
     stream_res = torch.cat(stream_res, dim=1)
 
     print(torch.allclose(full_res, stream_res, atol=1e-6))   

@@ -1,15 +1,11 @@
 import torch
 import torch.nn as nn
 
-from models.common_modules.regularization import SpecAugment
 from models.squeezeformer.encoder import AudioEncoder
 from models.squeezeformer.conv_module import CausalConv1d
-from models.common_modules.feature_extractor import FeaturesExractor
 from utils.decoding import ctc_greedy_decode_batch
 
 # from encoder import AudioEncoder
-
-GLOBAL_EPS = 1e-4
 
 
 class TransposedConv(nn.Module):
@@ -85,8 +81,6 @@ class ConformerHybrid(nn.Module):
         self.first_conv_kernel = self.time_factor * 2 + 1
         downsampled_chunk_size = chunk_size // self.time_factor
 
-        self.features_extractor = FeaturesExractor(freq_dim, n_mel, chunk_size=chunk_size)
-        self.spec_aug = SpecAugment(0.10, 0.05, 5, 3)
         self.downsample_conv = TransposedConv(n_mel, encoder_d_model, k_size=self.first_conv_kernel, stride=self.time_factor)
         self.encoder = AudioEncoder(encoder_d_model, downsampled_chunk_size, left_context_chunk_number,
                                     right_context_chunk_number, n_heads, n_groups, 9, layer_num, mamba_every_n_block,
@@ -107,7 +101,7 @@ class ConformerHybrid(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, audio_len, targets, targets_len):
-        # [B, C, T, F]
+        # [B, L, D]
         enc_out, corrected_len = self.run_encoder(x, audio_len)
 
         # CTC head
@@ -120,9 +114,7 @@ class ConformerHybrid(nn.Module):
         return ctc_logits, rnnt_logits, corrected_len
 
     def run_encoder(self, x, audio_len):
-        # [B, C, T, F]
-        x = self.features_extractor(x)
-        x = self.spec_aug(x, audio_len)
+        # [B, L, D]
         x = self.downsample_conv(x)
         corrected_lens = self._calculate_correct_lens(audio_len, tensor_len=x.shape[1])
         enc_out = self.encoder(x, corrected_lens)

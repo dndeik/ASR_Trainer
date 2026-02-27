@@ -12,6 +12,8 @@ import werpy
 from torch.utils.tensorboard import SummaryWriter
 
 from utils.decoding import rnnt_greedy_decode_batch, ctc_greedy_decode_batch
+from feature_extractor.feature_extractor import FeaturesExractor
+from models.common_modules.regularization import SpecAugment
 
 from datasets import BLANK_TOKEN_ID
 
@@ -40,6 +42,10 @@ class Trainer:
         self.optimizer = optimizer
         self.train_with_amp = config["trainer"]["train_with_amp"]
         self.scaler = torch.amp.GradScaler() if self.train_with_amp else None
+
+        self.feature_extractor = FeaturesExractor(**config["FFT"], n_mel=config["model"]["n_mel"]).to(self.device)
+        self.feature_extractor.freeze()
+        self.spec_aug = SpecAugment(0.10, 0.05, 5, 3).to(self.device)
 
         self.ctc_loss = torch.nn.modules.CTCLoss(blank=BLANK_TOKEN_ID, zero_infinity=True).to(self.device)
         self.rnnt_loss = torchaudio.functional.rnnt_loss
@@ -253,16 +259,19 @@ class Trainer:
         for step, (audio, audio_len, target, target_len) in enumerate(train_bar, 1):
             audio = audio.to(self.device)
             audio_len = audio_len.to(self.device).long()
+            features, audio_len = self.feature_extractor(audio, audio_len)
+            features = self.spec_aug(features)
+
             target = target.to(self.device).long()
             target_len = target_len.to(self.device).long()
 
             if self.train_with_amp:
                 with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
-                    ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(audio, audio_len, target, target_len)
+                    ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
                     loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
                                                                      target_len)
             else:
-                ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(audio, audio_len, target, target_len)
+                ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
                 loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
                                                                  target_len)
 
@@ -354,10 +363,12 @@ class Trainer:
         for step, (audio, audio_len, target, target_len) in enumerate(validation_bar, 1):
             audio = audio.to(self.device)
             audio_len = audio_len.to(self.device).long()
+            features, audio_len = self.feature_extractor(audio, audio_len)
+
             target = target.to(self.device).long()
             target_len = target_len.to(self.device).long()
 
-            ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(audio, audio_len, target, target_len)
+            ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
             loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
             total_loss += loss.item()
             total_ctc_loss += ctc_loss.item()

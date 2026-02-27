@@ -3,7 +3,7 @@ import torch.nn as nn
 
 from models.common_modules.regularization import SpecAugment
 from models.conformer.encoder import AudioEncoder
-from models.common_modules.feature_extractor import FeaturesExractor
+from feature_extractor.feature_extractor import FeaturesExractor
 from utils.decoding import ctc_greedy_decode_batch
 
 # from encoder import AudioEncoder
