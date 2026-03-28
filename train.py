@@ -8,7 +8,7 @@ import sentencepiece as spm
 
 from trainer import Trainer
 from models.squeezeformer.model import ConformerHybrid, count_parameters
-from datasets import MyDataset, BucketingSampler, custom_collate_fn
+from datasets import MyDataset, BucketingSampler
 
 
 # torch.backends.cudnn.deterministic =True
@@ -20,6 +20,9 @@ def run(rank, config, args):
 
     tokenizer = spm.SentencePieceProcessor(
         model_file=os.path.join(config['tokenizer']['tokenizer_path'], "tokenizer.model"))
+    blank_token_id = tokenizer.vocab_size()
+    lang_tokens = {"ru": blank_token_id + 1,
+                   "en": blank_token_id + 2}
 
     multi_gpu = args.world_size > 1
     if multi_gpu:
@@ -29,7 +32,8 @@ def run(rank, config, args):
         torch.cuda.set_device(rank)
         dist.barrier()
 
-    train_dataset = MyDataset(tokenizer=tokenizer, **config['train_dataset'], is_train=True)
+    train_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id, lang_tokens=lang_tokens,
+                              **config['train_dataset'], is_train=True, switch_lang_enable=True)
     train_dataset.set_augmentations(**config["augmentations"])
     train_sampler = BucketingSampler(train_dataset.get_audio_lens(), config["train_dataloader"]["batch_size"],
                                      bucket_size=600)
@@ -37,15 +41,16 @@ def run(rank, config, args):
                                                    pin_memory=config['train_dataloader']['pin_memory'],
                                                    num_workers=config['train_dataloader']['num_workers'],
                                                    shuffle=False,
-                                                   collate_fn=custom_collate_fn)
+                                                   collate_fn=train_dataset.custom_collate_fn)
 
-    validation_dataset = MyDataset(tokenizer=tokenizer, **config['validation_dataset'], is_train=False)
+    validation_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id, lang_tokens=lang_tokens,
+                                   **config['validation_dataset'], is_train=False)
     validation_sampler = torch.utils.data.distributed.DistributedSampler(validation_dataset) if multi_gpu else None
     validation_dataloader = torch.utils.data.DataLoader(dataset=validation_dataset, sampler=validation_sampler,
                                                         **config['validation_dataloader'], shuffle=False,
-                                                        collate_fn=custom_collate_fn)
+                                                        collate_fn=validation_dataset.custom_collate_fn)
 
-    model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1,
+    model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1 + len(lang_tokens),
                             encoder_d_model=config['model']['encoder_d_model'],
                             predictor_d_model=config['model']['predictor_d_model'],
                             joiner_d_model=config['model']['joiner_d_model'],
@@ -78,7 +83,8 @@ def run(rank, config, args):
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['optimizer']['lr'], weight_decay=0.01,
                                   betas=(0.9, 0.998))
 
-    trainer = Trainer(config=config, model=model, tokenizer=tokenizer, optimizer=optimizer,
+    trainer = Trainer(config=config, model=model, tokenizer=tokenizer, blank_token_id=blank_token_id,
+                      optimizer=optimizer,
                       train_dataloader=train_dataloader, validation_dataloader=validation_dataloader,
                       train_sampler=train_sampler, args=args)
     # trainer._validation_epoch(1)
