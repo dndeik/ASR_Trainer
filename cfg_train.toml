@@ -22,9 +22,8 @@ mamba_every_n_block = -1  # if you don't want to use mamba, set -1
 time_factor = 4
 n_mel = 80
 
-
 [tokenizer]
-tokenizer_path = "models/ru_tokenizer/tokenizer_spe_bpe_cp"
+tokenizer_path = "tokenizers/ru_en_tokenizer/tokenizer_spe_bpe_2048"
 
 [listener]
 listener_sr = 16000
@@ -79,11 +78,11 @@ epoch_when_enable_aug = 0
 save_checkpoint_interval = 1
 train_with_amp = true
 grad_accum = 3
-validation_interval = 1
+validation_interval_steps = 20000
 clip_grad_norm_value = 50.0
 
 [experiment]
 experiments_path = "experiments"
-exp_name = "RU 18 layer model GQA Squeezeformer | New tokenizer (800 tokens) | 2 layer 512 pred | Full train"
+exp_name = "RU-EN 18 layer model GQA Squeezeformer | Multi Lang | 2048 tokenizer"
 resume = false
-resume_from_folder = "experiments/RU_18_layer_model_GQA_Squeezeformer_no_Augs_untill_half_train_2026-02-11-11h53m"
+resume_from_folder = "experiments/RU-EN_18_layer_model_GQA_Squeezeformer_|_Multi_Lang_|_2048_tokenizer_2026-03-20-02h31m"

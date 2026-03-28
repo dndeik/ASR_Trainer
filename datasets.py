@@ -6,17 +6,18 @@ import torch
 import pandas as pd
 import numpy as np
 import librosa
+from typing import Optional
 from pathlib import Path
 from torch.utils import data
 
 from audiomentations import Compose, PitchShift, HighPassFilter, LowPassFilter, AddGaussianSNR, ApplyImpulseResponse, \
     AddGaussianNoise, SevenBandParametricEQ, LoudnessNormalization, Gain, Mp3Compression
 
-BLANK_TOKEN_ID = 1024
-
 
 class MyDataset(data.Dataset):
-    def __init__(self, tokenizer, train_manifest, file_num, min_len, max_len, augs_enable=False, is_train=False):
+    def __init__(self, tokenizer, blank_token_id: int, lang_tokens: Optional[dict], train_manifest: str, file_num: int,
+                 min_len: float, max_len: float, augs_enable: bool = False, is_train: bool = False,
+                 switch_lang_enable: bool = False):
         super().__init__()
 
         self.final_df = self.get_files_from_manifest(train_manifest)
@@ -27,6 +28,8 @@ class MyDataset(data.Dataset):
         print(f"Dataset contain {self.final_df['duration'].sum() / 3600:.2f} hours")
         self.max_len = max_len
         self.tokenizer = tokenizer
+        self.blank_token_id = blank_token_id
+        self.lang_tokens = lang_tokens
         self.sampling_rate = 16000
 
         self.is_train = is_train
@@ -37,6 +40,16 @@ class MyDataset(data.Dataset):
         self.max_augs = 2
         self.rir_folder = None
         self.noise_files = None
+
+        self.switch_lang_enable = switch_lang_enable
+        if self.switch_lang_enable:
+            self.lang_to_indices = {}
+            self.lang_to_durations = {}
+
+            for lang in self.final_df["lang"].unique():
+                idxs = np.where(self.final_df["lang"].values == lang)[0]
+                self.lang_to_indices[lang] = idxs
+                self.lang_to_durations[lang] = self.final_df["duration"].values[idxs]
 
     def set_augmentations(self, augs_enable=False, rir_folder=None, noise_folder="", min_augs=0, max_augs=2):
         self.augs_enable = augs_enable
@@ -55,7 +68,7 @@ class MyDataset(data.Dataset):
     @staticmethod
     def get_files_from_manifest(manifest):
         df = pd.read_json(manifest, lines=True)
-        df = df[["audio_filepath", "text", "duration"]]
+        df = df[["audio_filepath", "text", "duration", "lang"]]
 
         return df
 
@@ -123,7 +136,7 @@ class MyDataset(data.Dataset):
                 num_augmentations -= 1
 
             # Loudness Normalization
-            if np.random.rand() < 0.35 and num_augmentations > 0:
+            if np.random.rand() < 0.3 and num_augmentations > 0:
                 augmentations.append(LoudnessNormalization(p=1))
                 num_augmentations -= 1
 
@@ -185,25 +198,118 @@ class MyDataset(data.Dataset):
 
     def __getitem__(self, idx):
         file = self.final_df.iloc[idx]
-        audio_file_path = os.path.join(self.root_audio_folder, file["audio_filepath"])
-        audio, sr = librosa.load(audio_file_path)
-        if sr != self.sampling_rate:
-            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
 
-        if self.noise_files and self.augs_enable:
-            audio = self.add_bg_noise(audio, min_coef=0.15, max_coef=0.4, p=0.9)
+        audio_path = os.path.join(self.root_audio_folder, file["audio_filepath"])
+        audio = self._read_audio(audio_path)
+
+        text = file["text"]
+        lang = file["lang"]
+        duration = file["duration"]
+
+        token_ids = self.tokenizer.encode(text, out_type=int)
+        token_ids = [t for t in token_ids if t != 0]
+
+        if self.switch_lang_enable and random.random() < 0.25:
+            other_audio, other_tokens, other_lang = self.get_another_lang_sample(lang, duration)
+
+            if other_audio is not None:
+                pause_dur = random.uniform(0.2, 0.5)
+                pause = np.zeros(int(self.sampling_rate * pause_dur), dtype=audio.dtype)
+                audio = np.concatenate([audio, pause, other_audio], axis=-1)
+
+                if self.lang_tokens is not None and random.random() < 0.8:
+                    token_ids.append(self.lang_tokens[other_lang])
+
+                token_ids.extend(other_tokens)
+
+        # ================== AUGS ==================
+        if self.is_train and self.noise_files and self.augs_enable:
+            audio = self.add_bg_noise(audio, min_coef=0.15, max_coef=0.35, p=0.3)
 
         if self.is_train and self.augs_enable:
             audio = self.add_augmentations(audio, self.sampling_rate, add_gauss=False)
 
-        encoded_ids = self.tokenizer.encode(file["text"], out_type=int)
-        encoded_ids = [el for el in encoded_ids if
-                       el != 0]  # Drop unknown tokens for target, because models must not predict it
+        if self.lang_tokens is not None and (random.random() < 0.65 or not self.is_train):
+            token_ids.insert(0, self.lang_tokens[lang])
 
-        return torch.from_numpy(audio), torch.tensor(encoded_ids)
+        return torch.from_numpy(audio), torch.tensor(token_ids)
+
+    def _read_audio(self, audio_file_path):
+        audio, sr = librosa.load(audio_file_path)
+        if sr != self.sampling_rate:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=self.sampling_rate)
+        return audio
 
     def __len__(self):
         return len(self.final_df)
+
+    def custom_collate_fn(self, batch):
+        # 'batch' is a list of samples from MyDataset.__getitem__
+        # In this example, each sample is a tensor of variable length
+
+        # Get lengths of sequences
+        audio_len = []
+        ids_len = []
+        for audio, ids in batch:
+            audio_len.append(audio.shape[0])
+            ids_len.append(ids.shape[-1])
+
+        max_audio_len = max(audio_len)
+        max_ids_len = max(ids_len)
+
+        # Pad sequences to the max_len
+        audio_len = []
+        padded_audio = []
+
+        ids_len = []
+        padded_ids = []
+        for audio, ids in batch:
+            time_padding = max_audio_len - audio.shape[0]
+            padded_item = torch.cat((audio, torch.zeros(time_padding)), dim=0)
+            audio_len.append(audio.shape[0])
+            padded_audio.append(padded_item)
+
+            ids_padding = int(max_ids_len - ids.shape[-1])
+            padded_item = torch.cat((ids, torch.full(size=(ids_padding,), fill_value=self.blank_token_id)), dim=0)
+            ids_len.append(ids.shape[-1])
+            padded_ids.append(padded_item)
+
+        # Stack padded sequences and return lengths
+        return torch.stack(padded_audio), torch.tensor(audio_len), torch.stack(padded_ids), torch.tensor(ids_len)
+
+    def get_another_lang_sample(self, cur_lang, cur_len):
+        max_additional_len = self.max_len - cur_len
+
+        if max_additional_len <= 1.0:
+            return None, [], None
+
+        pause_dur = random.uniform(0.2, 0.5)
+        budget = max_additional_len - pause_dur
+
+        # --- выбираем другой язык ---
+        other_langs = [l for l in self.lang_to_indices.keys() if l != cur_lang]
+        other_lang = random.choice(other_langs)
+
+        idxs = self.lang_to_indices[other_lang]
+        durs = self.lang_to_durations[other_lang]
+
+        valid = durs <= budget
+        if not np.any(valid):
+            return None, [], None
+
+        valid_idxs = idxs[valid]
+        other_idx = np.random.choice(valid_idxs)
+        other_row = self.final_df.iloc[other_idx]
+
+        # --- аудио ---
+        other_audio_path = os.path.join(self.root_audio_folder, other_row["audio_filepath"])
+        other_audio = self._read_audio(other_audio_path)
+
+        # --- токены ---
+        other_tokens = self.tokenizer.encode(other_row["text"], out_type=int)
+        other_tokens = [t for t in other_tokens if t != 0]
+
+        return other_audio, other_tokens, other_lang
 
 
 class BucketingSampler(data.Sampler):
@@ -243,38 +349,3 @@ class BucketingSampler(data.Sampler):
             (len(bucket) + self.batch_size - 1) // self.batch_size
             for bucket in self.buckets
         )
-
-
-def custom_collate_fn(batch):
-    # 'batch' is a list of samples from MyDataset.__getitem__
-    # In this example, each sample is a tensor of variable length
-
-    # Get lengths of sequences
-    audio_len = []
-    ids_len = []
-    for audio, ids in batch:
-        audio_len.append(audio.shape[0])
-        ids_len.append(ids.shape[-1])
-
-    max_audio_len = max(audio_len)
-    max_ids_len = max(ids_len)
-
-    # Pad sequences to the max_len
-    audio_len = []
-    padded_audio = []
-
-    ids_len = []
-    padded_ids = []
-    for audio, ids in batch:
-        time_padding = max_audio_len - audio.shape[0]
-        padded_item = torch.cat((audio, torch.zeros(time_padding)), dim=0)
-        audio_len.append(audio.shape[0])
-        padded_audio.append(padded_item)
-
-        ids_padding = int(max_ids_len - ids.shape[-1])
-        padded_item = torch.cat((ids, torch.full(size=(ids_padding,), fill_value=BLANK_TOKEN_ID)), dim=0)
-        ids_len.append(ids.shape[-1])
-        padded_ids.append(padded_item)
-
-    # Stack padded sequences and return lengths
-    return torch.stack(padded_audio), torch.tensor(audio_len), torch.stack(padded_ids), torch.tensor(ids_len)
