@@ -54,12 +54,13 @@ def run(rank, config, args):
                             chunk_size=config['model']['chunk_size'],
                             left_context_chunk_number=config['model']['left_context_chunk_number'],
                             right_context_chunk_number=config['model']['right_context_chunk_number'],
-                            freq_dim=config['FFT']['hop_length'] + 1,
                             n_heads=config['model']['n_heads'],
                             n_groups=config['model']['n_groups'],
-                            layer_num=config['model']['layer_num'],
+                            encoder_layer_num=config['model']['encoder_layer_num'],
+                            predictor_layer_num=config['model']['predictor_layer_num'],
                             mamba_every_n_block=config['model']['mamba_every_n_block'],
-                            dropout=0.1)
+                            dropout=0.2,
+                            drop_path=0.15)
 
     if config["init_weights"]["checkpoint_path"]:
         ckpt = torch.load(config["init_weights"]["checkpoint_path"], map_location="cpu", weights_only=False)

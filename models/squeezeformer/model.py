@@ -5,8 +5,6 @@ from models.squeezeformer.encoder import AudioEncoder
 from models.squeezeformer.conv_module import CausalConv1d
 from utils.decoding import ctc_greedy_decode_batch
 
-# from encoder import AudioEncoder
-
 
 class TransposedConv(nn.Module):
     def __init__(self, in_channels, out_channels, k_size=3, stride=1):
@@ -23,10 +21,10 @@ class TransposedConv(nn.Module):
 
 
 class Decoder(nn.Module):
-    def __init__(self, num_vocab, embed_dim, hidden_dim, dropout=0.):
+    def __init__(self, num_vocab, embed_dim, hidden_dim, layer_num, dropout=0.):
         super().__init__()
         self.embedding = nn.Embedding(num_vocab, embed_dim)
-        self.predictor = nn.LSTM(embed_dim, hidden_dim, bidirectional=False, batch_first=True, num_layers=1,
+        self.predictor = nn.LSTM(embed_dim, hidden_dim, bidirectional=False, batch_first=True, num_layers=layer_num,
                                  dropout=dropout)
 
     def forward(self, y, y_lengths):
@@ -72,9 +70,9 @@ class SimpleJoiner(nn.Module):
 
 class ConformerHybrid(nn.Module):
     def __init__(self, num_vocab, encoder_d_model,
-                 predictor_d_model, joiner_d_model, freq_dim, n_mel, time_factor, n_heads, n_groups, chunk_size,
+                 predictor_d_model, joiner_d_model, n_mel, time_factor, n_heads, n_groups, chunk_size,
                  left_context_chunk_number=1, right_context_chunk_number=0,
-                 layer_num=8, mamba_every_n_block=3, dropout=0.1, drop_path=0.1):
+                 encoder_layer_num=8, predictor_layer_num=1, mamba_every_n_block=3, dropout=0.1, drop_path=0.1):
         super().__init__()
         # Encoder part
         self.time_factor = time_factor
@@ -83,7 +81,7 @@ class ConformerHybrid(nn.Module):
 
         self.downsample_conv = TransposedConv(n_mel, encoder_d_model, k_size=self.first_conv_kernel, stride=self.time_factor)
         self.encoder = AudioEncoder(encoder_d_model, downsampled_chunk_size, left_context_chunk_number,
-                                    right_context_chunk_number, n_heads, n_groups, 9, layer_num, mamba_every_n_block,
+                                    right_context_chunk_number, n_heads, n_groups, 9, encoder_layer_num, mamba_every_n_block,
                                     dropout, drop_path)
 
         # CTC head
@@ -94,8 +92,8 @@ class ConformerHybrid(nn.Module):
                                             nn.Linear(2 * encoder_d_model, num_vocab))
 
         # RNNT part
-        self.rnnt_decoder = Decoder(num_vocab, predictor_d_model, predictor_d_model, dropout=dropout)
-        self.rnnt_classifier = SimpleJoiner(encoder_d_model, predictor_d_model, joiner_d_model, num_vocab,
+        self.rnnt_decoder = Decoder(num_vocab, predictor_d_model, predictor_d_model, predictor_layer_num, dropout=dropout)
+        self.rnnt_classifier = SimpleJoiner(encoder_d_model, predictor_d_model, joiner_d_model, num_vocab, bias=True,
                                             dropout=dropout)
 
         self.dropout = nn.Dropout(dropout)
