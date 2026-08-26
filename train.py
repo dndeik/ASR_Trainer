@@ -2,7 +2,9 @@ import os
 import json
 import toml
 import torch
+import random
 import argparse
+import numpy as np
 import torch.distributed as dist
 import sentencepiece as spm
 
@@ -10,9 +12,20 @@ from trainer import Trainer
 from models.squeezeformer.model import ConformerHybrid, count_parameters
 from datasets import MyDataset, BucketingSampler
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
 
 # torch.backends.cudnn.deterministic =True
 # torch.autograd.set_detect_anomaly(True)
+
+
+def worker_init_fn(worker_id):
+    worker_info = torch.utils.data.get_worker_info()
+    seed = worker_info.seed % (2 ** 32)
+    np.random.seed(seed)
+    random.seed(seed)
+
 
 def run(rank, config, args):
     args.rank = rank
@@ -33,22 +46,36 @@ def run(rank, config, args):
         dist.barrier()
 
     train_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id, lang_tokens=lang_tokens,
-                              **config['train_dataset'], is_train=True, switch_lang_enable=True)
+                              **config['train_dataset'], is_train=True,
+                              lang_switch_enable=config["augmentations"]["lang_switch_enable"])
     train_dataset.set_augmentations(**config["augmentations"])
-    train_sampler = BucketingSampler(train_dataset.get_audio_lens(), config["train_dataloader"]["batch_size"],
-                                     bucket_size=600)
-    train_dataloader = torch.utils.data.DataLoader(dataset=train_dataset, batch_sampler=train_sampler,
-                                                   pin_memory=config['train_dataloader']['pin_memory'],
-                                                   num_workers=config['train_dataloader']['num_workers'],
-                                                   shuffle=False,
-                                                   collate_fn=train_dataset.custom_collate_fn)
+    train_sampler = BucketingSampler(
+        train_dataset.get_audio_lens(),
+        config["train_dataloader"]["batch_size"],
+        bucket_size=600,
+        drop_last=True
+    )
+    train_dataloader = torch.utils.data.DataLoader(
+        dataset=train_dataset,
+        batch_sampler=train_sampler,
+        pin_memory=config['train_dataloader']['pin_memory'],
+        num_workers=config['train_dataloader']['num_workers'],
+        shuffle=False,
+        collate_fn=train_dataset.custom_collate_fn,
+        worker_init_fn=worker_init_fn
+    )
 
     validation_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id, lang_tokens=lang_tokens,
                                    **config['validation_dataset'], is_train=False)
     validation_sampler = torch.utils.data.distributed.DistributedSampler(validation_dataset) if multi_gpu else None
-    validation_dataloader = torch.utils.data.DataLoader(dataset=validation_dataset, sampler=validation_sampler,
-                                                        **config['validation_dataloader'], shuffle=False,
-                                                        collate_fn=validation_dataset.custom_collate_fn)
+    validation_dataloader = torch.utils.data.DataLoader(
+        dataset=validation_dataset,
+        sampler=validation_sampler,
+        **config['validation_dataloader'],
+        shuffle=False,
+        collate_fn=validation_dataset.custom_collate_fn,
+        worker_init_fn=worker_init_fn
+    )
 
     model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1 + len(lang_tokens),
                             encoder_d_model=config['model']['encoder_d_model'],
@@ -83,11 +110,18 @@ def run(rank, config, args):
     optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['optimizer']['lr'], weight_decay=0.01,
                                   betas=(0.9, 0.998))
 
+    t0 = config["trainer"]["warm_up_steps"] / int(
+        len(train_dataloader) * config["trainer"]["epochs"] // config["trainer"]["grad_accum"])
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[1e-4],
+                                                    div_factor=200, pct_start=t0, anneal_strategy='cos',
+                                                    steps_per_epoch=len(train_dataloader) // config["trainer"][
+                                                        "grad_accum"],
+                                                    epochs=config["trainer"]["epochs"])
+
     trainer = Trainer(config=config, model=model, tokenizer=tokenizer, blank_token_id=blank_token_id,
-                      optimizer=optimizer,
+                      optimizer=optimizer, scheduler=scheduler,
                       train_dataloader=train_dataloader, validation_dataloader=validation_dataloader,
                       train_sampler=train_sampler, args=args)
-    # trainer._validation_epoch(1)
     trainer.train()
 
     if args.world_size > 1:

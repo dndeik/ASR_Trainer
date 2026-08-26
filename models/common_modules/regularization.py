@@ -57,7 +57,7 @@ class SpecAugment(nn.Module):
                     if t == 0:
                         continue
                     t0 = random.randint(0, max(0, valid_L - t))
-                    x[b, t0: t0 + t, :] = 0.0
+                    x[b, t0:t0+t, :] = 0.0
 
             # ===== Frequency masking =====
             total_freq_to_mask = int(self.freq_mask_percent * D)
@@ -88,3 +88,20 @@ class DropPath(nn.Module):
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         random_tensor = (torch.rand(shape, device=x.device, dtype=x.dtype) < keep_prob).float()
         return x / keep_prob * random_tensor
+
+
+class TokenDropout(nn.Module):
+    def __init__(self, p=0.05):
+        super().__init__()
+        self.p = p
+
+    def forward(self, x):
+        """
+        x: [B, T, D]
+        Маска применяется по временной оси, сохраняется для всего батча
+        """
+        if not self.training or self.p == 0:
+            return x
+
+        mask = torch.rand(x.size(0), x.size(1), 1, device=x.device) > self.p
+        return x * mask.float()

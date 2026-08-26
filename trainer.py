@@ -14,7 +14,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from utils.decoding import rnnt_greedy_decode_batch, ctc_greedy_decode_batch
 from feature_extractor.feature_extractor import FeaturesExractor
-from models.common_modules.regularization import SpecAugment
+from models.common_modules.regularization import SpecAugment, TokenDropout
 
 
 def set_seed(seed):
@@ -27,7 +27,7 @@ def set_seed(seed):
 
 
 class Trainer:
-    def __init__(self, config, model, tokenizer, blank_token_id, optimizer,
+    def __init__(self, config, model, tokenizer, blank_token_id, optimizer, scheduler,
                  train_dataloader, validation_dataloader, train_sampler, args):
         set_seed(time.time_ns() % 10 ** 6)
 
@@ -40,25 +40,22 @@ class Trainer:
         self.tokenizer = tokenizer
         self.blank_token_id = blank_token_id
         self.optimizer = optimizer
-        self.train_with_amp = config["trainer"]["train_with_amp"]
-        self.scaler = torch.amp.GradScaler() if self.train_with_amp else None
+        self.scheduler = scheduler
+        self.accum_step = config["trainer"]["grad_accum"]
+
+        self.use_amp = config["trainer"].get("train_with_amp", False)
+        self.amp_dtype = torch.bfloat16 if self.use_amp else torch.float32
+        # Для BF16 GradScaler не нужен, так как динамический диапазон совпадает с FP32
+        self.scaler = None
 
         self.feature_extractor = FeaturesExractor(**config["FFT"], n_mel=config["model"]["n_mel"]).to(self.device)
         self.feature_extractor.freeze()
-        self.spec_aug = SpecAugment(0.15, 0.15, 25, 15, p=0.85, adaptive_time_mask=True).to(self.device)
+        self.spec_aug = SpecAugment(0.2, 0.15, 30, 15, p=0.85, adaptive_time_mask=True).to(self.device)
+        self.token_dropout = TokenDropout(0.1)
 
         self.ctc_loss = torch.nn.modules.CTCLoss(blank=self.blank_token_id, zero_infinity=True).to(self.device)
         self.rnnt_loss = torchaudio.functional.rnnt_loss
-        self.ctc_weight = 0.35
-
-        self.accum_step = config["trainer"]["grad_accum"]
-
-        t0 = config["trainer"]["warm_up_steps"] / int(
-            len(train_dataloader) * config["trainer"]["epochs"] // self.accum_step)
-        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=config["optimizer"]["lr"],
-                                                             div_factor=200, pct_start=t0, anneal_strategy='cos',
-                                                             steps_per_epoch=len(train_dataloader) // self.accum_step,
-                                                             epochs=config["trainer"]["epochs"])
+        self.ctc_weight = 0.3
 
         self.train_sampler = train_sampler
         self.train_dataloader = train_dataloader
@@ -68,6 +65,7 @@ class Trainer:
         self.trainer_config = config['trainer']
         self.epochs = self.trainer_config['epochs']
         self.save_checkpoint_interval = self.trainer_config['save_checkpoint_interval']
+        self.save_n_last_checkpoints = self.trainer_config.get('save_n_last_checkpoints', -1)
         self.validation_interval_steps = self.trainer_config['validation_interval_steps']
         self.last_val_step = 0
         self.clip_grad_norm_value = self.trainer_config['clip_grad_norm_value']
@@ -110,7 +108,8 @@ class Trainer:
 
         self.start_epoch = 1
         self.global_step = 0
-        self.best_score = 0
+        self.best_score = float('inf')
+        self.state_dict_best = None
 
         self.aug_start_epoch = config["trainer"]["epoch_when_enable_aug"]
 
@@ -137,21 +136,40 @@ class Trainer:
 
     def _save_checkpoint(self, step: int, score: Optional[float]):
         model_dict = self.model.module.state_dict() if self.world_size > 1 else self.model.state_dict()
-        if self.train_with_amp:
-            state_dict = {'step': step,
-                          'optimizer': self.optimizer.state_dict(),
-                          'scheduler': self.scheduler.state_dict(),
-                          'model': model_dict,
-                          'scaler': self.scaler.state_dict()}
-        else:
-            state_dict = {'step': step,
-                          'optimizer': self.optimizer.state_dict(),
-                          'scheduler': self.scheduler.state_dict(),
-                          'model': model_dict}
+        epoch = (step * self.accum_step) // len(self.train_dataloader)
+
+        state_dict = {
+            'step': step,
+            'epoch': epoch,
+            'best_score': self.best_score,
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+            'model': model_dict
+        }
 
         torch.save(state_dict, os.path.join(self.checkpoint_path, f'model_{str(step).zfill(10)}.tar'))
 
-        if score is not None and score > self.best_score:
+        if self.save_n_last_checkpoints > 0:
+            all_checkpoints = []
+            for fname in os.listdir(self.checkpoint_path):
+                if fname.startswith('model_') and fname.endswith('.tar') and fname != 'best_model.tar':
+                    all_checkpoints.append(fname)
+
+            def extract_epoch(filename):
+                return int(filename.split('_')[1].split('.')[0])
+
+            all_checkpoints.sort(key=extract_epoch)
+
+            if len(all_checkpoints) > self.save_n_last_checkpoints:
+                to_delete = all_checkpoints[:-self.save_n_last_checkpoints]
+                for old_name in to_delete:
+                    old_path = os.path.join(self.checkpoint_path, old_name)
+                    try:
+                        os.remove(old_path)
+                    except OSError as e:
+                        print(f'Failed to delete {old_path}: {e}')
+
+        if score is not None and score < self.best_score:
             self.state_dict_best = state_dict.copy()
             self.best_score = score
 
@@ -164,18 +182,13 @@ class Trainer:
         latest_checkpoints = sorted(glob(os.path.join(self.checkpoint_path, 'model_*.tar')))[-1]
 
         map_location = self.device
-        checkpoint = torch.load(latest_checkpoints, map_location=map_location)
+        checkpoint = torch.load(latest_checkpoints, map_location=map_location, weights_only=False)
 
         self.global_step = checkpoint['step'] + 1
         self.start_epoch = (self.global_step * self.accum_step) // len(self.train_dataloader)
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.scheduler.load_state_dict(checkpoint['scheduler'])
-
-        if self.train_with_amp:
-            if 'scaler' in checkpoint:
-                self.scaler.load_state_dict(checkpoint['scaler'])
-            else:
-                print("AMP is enabled but the checkpoint doesn't contain scaler state. New scaler will be initialized")
+        self.best_score = checkpoint.get('best_score', float('inf'))
 
         if self.world_size > 1:
             self.model.module.load_state_dict(checkpoint['model'])
@@ -193,15 +206,12 @@ class Trainer:
         elif type == "rnnt":
             batch_decoded = rnnt_greedy_decode_batch(esti, blank=blank_token)
 
-        batch_decoded = [[x for x in sublist if x < blank_token] for sublist in
-                         batch_decoded]  # Drop lang tokens if it is included
+        batch_decoded = [[x for x in sublist if x < blank_token] for sublist in batch_decoded]
         esti_list = [self.tokenizer.decode(batch_el) for batch_el in batch_decoded]
 
-        # Targets processing
         target = target.detach().int()
         target_batch_decoded = ctc_greedy_decode_batch(target, blank=blank_token)
-        target_batch_decoded = [[x for x in sublist if x < blank_token] for sublist in
-                                target_batch_decoded]  # Drop lang tokens if it is included
+        target_batch_decoded = [[x for x in sublist if x < blank_token] for sublist in target_batch_decoded]
         target_list = [self.tokenizer.decode(batch_el) for batch_el in target_batch_decoded]
 
         norm_esti_list = werpy.normalize(esti_list)
@@ -211,7 +221,6 @@ class Trainer:
         norm_target_list = [el.replace("¿", "").replace("¡", "").strip() for el in norm_target_list]
 
         wer = werpy.wer(norm_target_list, norm_esti_list)
-
         wer = wer if wer is not None else 1.
 
         return wer, esti_list, target_list
@@ -226,31 +235,84 @@ class Trainer:
         return ctc_out, rnnt_out, corrected_audio_len
 
     def _calculate_loss(self, ctc_logits, rnnt_logits, targets, x_lengths, target_lengths):
+        ctc_logits = ctc_logits.float()
+        rnnt_logits = rnnt_logits.float()
+
         targets = targets.to(torch.int32)
         x_lengths = x_lengths.to(torch.int32)
         target_lengths = target_lengths.to(torch.int32)
+
+        ctc_weight = 0.75
+        rnnt_weight = 1
 
         if ctc_logits.shape[0] > x_lengths.max():
             print("WARNING: logits more then x_lengths max")
             ctc_logits = ctc_logits[:x_lengths.max(), ...]
 
-        ctc_logits = torch.nn.functional.log_softmax(ctc_logits, dim=-1)
-        rnnt_logits = torch.nn.functional.log_softmax(rnnt_logits, dim=-1)
+        ctc_log_probs = torch.nn.functional.log_softmax(ctc_logits, dim=-1)
+        loss_ctc = self.ctc_loss(ctc_log_probs, targets, x_lengths, target_lengths)
 
+        # RNNT loss принимает сырые логиты
         loss_rnnt = self.rnnt_loss(rnnt_logits, targets, x_lengths, target_lengths, blank=self.blank_token_id)
-        loss_ctc = self.ctc_loss(ctc_logits, targets, x_lengths, target_lengths)
 
-        loss = self.ctc_weight * loss_ctc + (1 - self.ctc_weight) * loss_rnnt
+        lambda_logit_weight = 1e-4
+        logit_norm_penalty = rnnt_logits.pow(2).mean() * lambda_logit_weight
 
-        return loss, loss_ctc, loss_rnnt
+        loss = ctc_weight * loss_ctc + rnnt_weight * loss_rnnt + logit_norm_penalty
+
+        return {
+            'total_loss': loss,
+            'ctc_loss': loss_ctc,
+            'rnnt_loss': loss_rnnt,
+            'logit_norm_loss': logit_norm_penalty,
+        }
+
+    @staticmethod
+    def _compute_joiner_penalties(
+            rnnt_logits,
+            blank_token_id,
+            lambda_margin,
+            margin_threshold,
+            lambda_blank,
+            blank_threshold,
+            lambda_logit_norm,
+    ):
+        """
+        Пенальти на сырые логиты joiner'а.
+        """
+        rnnt_logits = rnnt_logits.float()
+
+        # 1. Logit Margin Penalty
+        sorted_logits, _ = torch.sort(rnnt_logits, dim=-1, descending=True)
+        margin = sorted_logits[..., 0] - sorted_logits[..., 1]  # [B, T, U+1]
+        margin_penalty = torch.nn.functional.relu(margin - margin_threshold).pow(2).mean()
+
+        # 2. Blank Confidence Penalty
+        probs = torch.softmax(rnnt_logits, dim=-1)
+        p_blank = probs[..., blank_token_id]  # [B, T, U+1]
+        blank_penalty = torch.nn.functional.relu(p_blank - blank_threshold).pow(2).mean()
+
+        # 3. Logit Norm Penalty
+        logit_norm_penalty = rnnt_logits.pow(2).mean()
+
+        total = (
+                lambda_margin * margin_penalty
+                + lambda_blank * blank_penalty
+                + lambda_logit_norm * logit_norm_penalty
+        )
+
+        return {
+            'total': total,
+            'margin': margin_penalty,
+            'blank': blank_penalty,
+            'logit_norm': logit_norm_penalty,
+        }
 
     @torch.no_grad()
     def _validate(self):
-        total_loss = 0
+        total_val_losses = {}
         total_ctc_wer = 0
         total_rnnt_wer = 0
-        total_ctc_loss = 0
-        total_rnnt_loss = 0
         validation_bar = tqdm(self.validation_dataloader, ncols=160)
         for step, (audio, audio_len, target, target_len) in enumerate(validation_bar, 1):
             audio = audio.to(self.device)
@@ -260,32 +322,37 @@ class Trainer:
             target = target.to(self.device).long()
             target_len = target_len.to(self.device).long()
 
-            ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
-            loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
-            total_loss += loss.item()
-            total_ctc_loss += ctc_loss.item()
-            total_rnnt_loss += rnnt_loss.item()
+            if self.use_amp:
+                with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                    ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
+                    loss_dict = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
+            else:
+                ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
+                loss_dict = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
 
-            batch_rnnt_wer, esti_text, target_text = self._calculate_wer(rnnt_out, target, type="rnnt")
+            for k, v in loss_dict.items():
+                total_val_losses[k] = total_val_losses.get(k, 0) + v.item()
+
+            batch_rnnt_wer, esti_rnnt_text, target_text = self._calculate_wer(rnnt_out, target, type="rnnt")
             total_rnnt_wer += batch_rnnt_wer
 
-            batch_ctc_wer, esti_text, target_text = self._calculate_wer(ctc_out, target, type="ctc")
+            batch_ctc_wer, esti_ctc_text, target_text = self._calculate_wer(ctc_out, target, type="ctc")
             total_ctc_wer += batch_ctc_wer
 
             validation_bar.desc = f'validate[{self.global_step}][{datetime.now().strftime("%Y-%m-%d-%H:%M")}]'
-            validation_bar.postfix = f'valid_loss={total_loss / step:.2f}, valid_ctc_wer={total_ctc_wer / step:.2f}, valid_rnnt_wer={total_rnnt_wer / step:.2f}'
+            avg_val_loss = total_val_losses.get('total_loss', 0) / step
+            validation_bar.postfix = f'valid_loss={avg_val_loss:.2f}, valid_ctc_wer={total_ctc_wer / step:.2f}, valid_rnnt_wer={total_rnnt_wer / step:.2f}'
 
-            print()
-            print("REF: ", target_text[0])
-            print("EST: ", esti_text[0])
+            validation_bar.write("")
+            validation_bar.write(f"REF: {target_text[0]}")
+            validation_bar.write(f"EST: {esti_rnnt_text[0]}")
 
         if (self.world_size > 1) and (self.device != torch.device("cpu")):
             torch.cuda.synchronize(self.device)
 
         if self.rank == 0:
-            self.writer.add_scalar('Epoch_Total_Loss/val', total_loss / step, self.global_step)
-            self.writer.add_scalar('Epoch_CTC_Loss/val', total_ctc_loss / step, self.global_step)
-            self.writer.add_scalar('Epoch_RNNT_Loss/val', total_rnnt_loss / step, self.global_step)
+            for k, v in total_val_losses.items():
+                self.writer.add_scalar(f'Epoch_{k}/val', v / step, self.global_step)
             self.writer.add_scalar('Epoch_WER/val(ctc)', total_ctc_wer / step, self.global_step)
             self.writer.add_scalar('Epoch_WER/val(rnnt)', total_rnnt_wer / step, self.global_step)
 
@@ -293,23 +360,17 @@ class Trainer:
 
     def _validate_and_save(self, step):
         self._set_eval_mode()
-        valid_loss = self._validate()
+        score = self._validate()
 
         if self.rank == 0:
-            self._save_checkpoint(step, valid_loss)
+            self._save_checkpoint(step, score)
 
     def train(self):
         if self.resume:
             self._resume_checkpoint()
 
-        total_loss = 0
-        accum_loss = 0
-
-        total_ctc_loss = 0
-        accum_ctc_loss = 0
-
-        total_rnnt_loss = 0
-        accum_rnnt_loss = 0
+        total_losses = {}
+        accum_losses = {}
 
         total_wer = 0
         accum_wer = 0
@@ -327,48 +388,41 @@ class Trainer:
             set_seed(time.time_ns() % 10 ** 6)
             self._set_train_mode()
 
-            start_step = (self.global_step * self.accum_step) % len(self.train_dataloader) if self.resume else 1
             self.resume = False
 
-            # Epoch handler
-            train_bar = tqdm(self.train_dataloader, ncols=160, initial=start_step)
+            train_bar = tqdm(self.train_dataloader, total=len(self.train_dataloader), ncols=160)
             self.optimizer.zero_grad()
 
-            for step, (audio, audio_len, target, target_len) in enumerate(train_bar, start_step):
+            for step, (audio, audio_len, target, target_len) in enumerate(train_bar, 1):
                 audio = audio.to(self.device)
                 audio_len = audio_len.to(self.device).long()
                 features, audio_len = self.feature_extractor(audio, audio_len)
+                features = self.token_dropout(features)
                 features = self.spec_aug(features)
 
                 target = target.to(self.device).long()
                 target_len = target_len.to(self.device).long()
 
-                if self.train_with_amp:
-                    with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+                if self.use_amp:
+                    with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
                         ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target,
                                                                                     target_len)
-                        loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
-                                                                         target_len)
+                        loss_dict = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
                 else:
                     ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
-                    loss, ctc_loss, rnnt_loss = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len,
-                                                                     target_len)
+                    loss_dict = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
 
-                if torch.isnan(loss):
-                    print("Nan loss")
+                loss = loss_dict['total_loss']
+
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print("NaN/Inf loss detected, skipping step.")
+                    self.optimizer.zero_grad()
                     continue
 
-                cur_loss = loss.item()
-                total_loss += cur_loss
-                accum_loss += cur_loss
-
-                cur_ctc_loss = ctc_loss.item()
-                total_ctc_loss += cur_ctc_loss
-                accum_ctc_loss += cur_ctc_loss
-
-                cur_rnnt_loss = rnnt_loss.item()
-                total_rnnt_loss += cur_rnnt_loss
-                accum_rnnt_loss += cur_rnnt_loss
+                for k, v in loss_dict.items():
+                    val = v.item()
+                    total_losses[k] = total_losses.get(k, 0) + val
+                    accum_losses[k] = accum_losses.get(k, 0) + val
 
                 self._optimization_step(step, loss)
 
@@ -381,24 +435,22 @@ class Trainer:
 
                 train_bar.desc = f'train[{epoch}/{self.epochs}][{datetime.now().strftime("%Y-%m-%d-%H:%M")}]'
 
-                train_bar.postfix = f'train_loss={total_loss / steps_from_last_val:.2f}, wer({wer_type})={total_wer / steps_from_last_val:.3f}, g_step={self.global_step}'
+                avg_loss = total_losses.get('total_loss', 0) / max(steps_from_last_val, 1)
+                avg_wer = total_wer / max(steps_from_last_val, 1)
+                train_bar.postfix = f'train_loss={avg_loss:.2f}, wer({wer_type})={avg_wer:.3f}, g_step={self.global_step}'
 
                 log_step = self.accum_step
                 if step % log_step == 0 and self.rank == 0:
-                    print()
-                    print("REF: ", target_text[0])
-                    print("EST: ", esti_text[0])
+                    train_bar.write("")
+                    train_bar.write(f"REF: {target_text[0]}")
+                    train_bar.write(f"EST: {esti_text[0]}")
                     self.writer.add_scalars('LR', {'lr': self.optimizer.param_groups[0]['lr']},
                                             self.global_step)
-                    self.writer.add_scalars('Monitoring', {'total_loss': accum_loss / log_step,
-                                                           'ctc_loss': accum_ctc_loss / log_step,
-                                                           'rnnt_loss': accum_rnnt_loss / log_step},
-                                            self.global_step)
+                    log_dict = {k: accum_losses.get(k, 0) / log_step for k in accum_losses}
+                    self.writer.add_scalars('Monitoring', log_dict, self.global_step)
                     self.writer.add_scalars('WER', {'train_wer': accum_wer / log_step},
                                             self.global_step)
-                    accum_loss = 0
-                    accum_ctc_loss = 0
-                    accum_rnnt_loss = 0
+                    accum_losses = {}
                     accum_wer = 0
 
                 if self.world_size > 1 and (self.device != torch.device("cpu")):
@@ -410,14 +462,11 @@ class Trainer:
                     self._set_train_mode()
 
                     steps_in_cycle = self.validation_interval_steps * self.accum_step
-                    self.writer.add_scalar('Epoch_Total_Loss/train', total_loss / steps_in_cycle, self.global_step)
-                    self.writer.add_scalar('Epoch_CTC_Loss/train', total_ctc_loss / steps_in_cycle, self.global_step)
-                    self.writer.add_scalar('Epoch_RNNT_Loss/train', total_rnnt_loss / steps_in_cycle, self.global_step)
+                    for k, v in total_losses.items():
+                        self.writer.add_scalar(f'Epoch_{k}/train', v / steps_in_cycle, self.global_step)
                     self.writer.add_scalar('Epoch_WER/train(ctc)', total_wer / steps_in_cycle, self.global_step)
 
-                    total_loss = 0
-                    total_ctc_loss = 0
-                    total_rnnt_loss = 0
+                    total_losses = {}
                     total_wer = 0
 
                     steps_from_last_val = 0
@@ -432,24 +481,39 @@ class Trainer:
     def _optimization_step(self, step, loss):
         loss = loss / self.accum_step
 
-        if self.train_with_amp:
-            self.scaler.scale(loss).backward()
-        else:
-            loss.backward()
+        # [ИЗМЕНЕНО ДЛЯ BF16] Прямой backward, без GradScaler
+        loss.backward()
 
         if step % self.accum_step == 0:
-            if self.train_with_amp:
-                self.scaler.unscale_(self.optimizer)
-                cur_gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                cur_gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_grad_norm_value)
+            self._log_grad_norms(step)
+            cur_gn = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.clip_grad_norm_value
+            )
 
-                self.optimizer.step()
-
+            self.optimizer.step()
             self.optimizer.zero_grad()
             self.scheduler.step()
-
             self.global_step += 1
             self.writer.add_scalars('Grad norm', {'grad_norm': cur_gn}, self.global_step)
+
+    def _log_grad_norms(self, step):
+        """Замер градиентов по группам параметров."""
+
+        def grad_norm(params):
+            grads = [p.grad.norm() for p in params if p.grad is not None]
+            if not grads:
+                return torch.tensor(0.0)
+            return torch.norm(torch.stack(grads))
+
+        enc_grad = grad_norm(self.model.encoder.parameters())
+        rnnt_grad = grad_norm(self.model.rnnt_classifier.parameters())
+        ctc_grad = grad_norm(self.model.ctc_classifier.parameters())
+        dec_grad = grad_norm(self.model.rnnt_decoder.parameters())
+
+        grad_dict = {
+            'encoder': enc_grad,
+            'rnnt_classifier': rnnt_grad,
+            'ctc_classifier': ctc_grad,
+            'rnnt_decoder': dec_grad,
+        }
+        self.writer.add_scalars('Grads', grad_dict, self.global_step)

@@ -62,6 +62,7 @@ min_augs = 1
 max_augs = 3
 noise_folder = "<folder path>"
 rir_folder = "<folder_path>"
+lang_switch_enable = true
 
 [logger]
 log_to_clearml = true
@@ -76,6 +77,7 @@ epochs = 30
 warm_up_steps = 2500
 epoch_when_enable_aug = 0
 save_checkpoint_interval = 1
+save_n_last_checkpoints = 4
 train_with_amp = true
 grad_accum = 3
 validation_interval_steps = 20000
