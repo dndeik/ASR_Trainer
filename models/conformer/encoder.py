@@ -16,7 +16,8 @@ GLOBAL_EPS = 1e-4
 
 
 class BaseEncoderBlock(nn.Module):
-    def __init__(self, type: str, d_model, n_heads, n_groups, chunk_size, left_context, right_context=0, dropout=0.):
+    def __init__(self, type: str, d_model, n_heads, n_groups, chunk_size, left_context,
+                 right_context=0, dropout=0., drop_path=0.):
         super().__init__()
         self.chunk_size = chunk_size
         self.left_context = left_context
@@ -38,7 +39,7 @@ class BaseEncoderBlock(nn.Module):
         self.pre_ffn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
         self.ffn = SwiGLUFFN(d_model, factor=2)
 
-        self.drop_block = DropPath(dropout)
+        self.drop_block = DropPath(drop_path)
 
     def forward(self, x, attn_mask):
         B, L, D = x.shape
@@ -66,7 +67,9 @@ class BaseEncoderBlock(nn.Module):
 
 
 class AudioEncoder(nn.Module):
-    def __init__(self, inter_d_model, chunk_size, left_context_chunk_number, right_context_chunk_number, n_heads, n_groups, layer_num=1, mamba_every_n_block=3, dropout=0.1):
+    def __init__(self, inter_d_model, chunk_size, left_context_chunk_number,
+                 right_context_chunk_number, n_heads, n_groups, layer_num=1,
+                 mamba_every_n_block=3, dropout=0.1, drop_path=0.0):
         super().__init__()
         self.n_heads = n_heads
         self.dropout = dropout
@@ -82,7 +85,10 @@ class AudioEncoder(nn.Module):
         self.blocks = nn.ModuleList()
         for i in range(layer_num):
             block_type = "mamba" if (i+1) % mamba_every_n_block == 0 and use_mamba else "attn"
-            self.blocks.append(BaseEncoderBlock(block_type, inter_d_model, n_heads, n_groups, self.chunk_size, self.left_context, self.right_context, dropout))
+            self.blocks.append(BaseEncoderBlock(
+                block_type, inter_d_model, n_heads, n_groups, self.chunk_size,
+                self.left_context, self.right_context, dropout, drop_path,
+            ))
 
     def forward(self, x, audio_len=None):
         mask = get_mask_vector(self.chunk_size, x.shape[1] + self.left_context, self.left_context, self.right_context, device=x.device)

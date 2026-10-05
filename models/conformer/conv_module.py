@@ -2,6 +2,30 @@ import torch
 import torch.nn as nn
 
 
+class CausalConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, bias=True, conv_style="dw"):
+        super().__init__()
+        if conv_style == "full":
+            conv_type = nn.Conv1d
+        elif conv_style == "dw":
+            conv_type = nn.Sequential(
+                nn.Conv1d(in_channels, in_channels, kernel_size, stride=stride,
+                          groups=in_channels, bias=False),
+                nn.Conv1d(in_channels, out_channels, kernel_size=1, bias=bias),
+            )
+        else:
+            raise NotImplementedError("Unknown conv_style")
+        if conv_style == "full":
+            self.conv = conv_type(in_channels, out_channels, kernel_size,
+                                  stride=stride, bias=bias)
+        else:
+            self.conv = conv_type
+        self.conv_padding = nn.ConstantPad1d((kernel_size - stride, 0), 0)
+
+    def forward(self, x):
+        return self.conv(self.conv_padding(x))
+
+
 class TransposedLayerNorm(nn.Module):
     def __init__(self, normalized_shape, eps=1e-5, bias=True):
         super().__init__()
