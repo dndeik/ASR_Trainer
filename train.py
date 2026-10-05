@@ -34,9 +34,6 @@ def run(rank, config, args):
     tokenizer = spm.SentencePieceProcessor(
         model_file=os.path.join(config['tokenizer']['tokenizer_path'], "tokenizer.model"))
     blank_token_id = tokenizer.vocab_size()
-    lang_tokens = {"ru": blank_token_id + 1,
-                   "en": blank_token_id + 2}
-
     multi_gpu = args.world_size > 1
     if multi_gpu:
         os.environ['MASTER_ADDR'] = 'localhost'
@@ -45,7 +42,7 @@ def run(rank, config, args):
         torch.cuda.set_device(rank)
         dist.barrier()
 
-    train_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id, lang_tokens=lang_tokens,
+    train_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id,
                               **config['train_dataset'], is_train=True,
                               lang_switch_enable=config["augmentations"]["lang_switch_enable"])
     train_dataset.set_augmentations(**config["augmentations"])
@@ -65,7 +62,7 @@ def run(rank, config, args):
         worker_init_fn=worker_init_fn
     )
 
-    validation_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id, lang_tokens=lang_tokens,
+    validation_dataset = MyDataset(tokenizer=tokenizer, blank_token_id=blank_token_id,
                                    **config['validation_dataset'], is_train=False)
     validation_sampler = torch.utils.data.distributed.DistributedSampler(validation_dataset) if multi_gpu else None
     validation_dataloader = torch.utils.data.DataLoader(
@@ -77,7 +74,7 @@ def run(rank, config, args):
         worker_init_fn=worker_init_fn
     )
 
-    model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1 + len(lang_tokens),
+    model = ConformerHybrid(num_vocab=tokenizer.vocab_size() + 1,
                             encoder_d_model=config['model']['encoder_d_model'],
                             predictor_d_model=config['model']['predictor_d_model'],
                             joiner_d_model=config['model']['joiner_d_model'],

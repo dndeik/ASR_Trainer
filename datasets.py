@@ -16,7 +16,7 @@ from audiomentations import Compose, PitchShift, HighPassFilter, LowPassFilter, 
 
 
 class MyDataset(data.Dataset):
-    def __init__(self, tokenizer, blank_token_id: int, lang_tokens: Optional[dict], train_manifest: str, file_num: int,
+    def __init__(self, tokenizer, blank_token_id: int, train_manifest: str, file_num: int,
                  min_len: float, max_len: float, augs_enable: bool = False, is_train: bool = False,
                  lang_switch_enable: bool = False):
         super().__init__()
@@ -30,7 +30,6 @@ class MyDataset(data.Dataset):
         self.max_len = max_len
         self.tokenizer = tokenizer
         self.blank_token_id = blank_token_id
-        self.lang_tokens = lang_tokens
         self.sampling_rate = 16000
 
         self.is_train = is_train
@@ -251,9 +250,6 @@ class MyDataset(data.Dataset):
                 pause = np.zeros(int(self.sampling_rate * pause_dur), dtype=audio.dtype)
                 audio = np.concatenate([audio, pause, other_audio], axis=-1)
 
-                if self.lang_tokens is not None and random.random() < 0.8:
-                    token_ids.append(self.lang_tokens[other_lang])
-
                 token_ids.extend(other_tokens)
 
         # 2. Speed Perturbation
@@ -267,10 +263,6 @@ class MyDataset(data.Dataset):
         # 4. Spectral Augmentations (EQ, Pitch, Gain, etc.)
         if self.is_train and self.augs_enable:
             audio = self.add_augmentations(audio, self.sampling_rate, add_gauss=False)
-
-        # 5. Language token
-        if self.lang_tokens is not None and (random.random() < 0.65 or not self.is_train):
-            token_ids.insert(0, self.lang_tokens[lang])
 
         return torch.from_numpy(audio), torch.tensor(token_ids)
 
