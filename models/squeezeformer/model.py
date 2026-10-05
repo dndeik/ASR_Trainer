@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from models.squeezeformer.encoder import AudioEncoder
 from models.squeezeformer.conv_module import CausalConv1d
+from models.common_modules.transformer_predictor import TransformerDecoder
 from utils.decoding import ctc_greedy_decode_batch
 
 
@@ -18,27 +19,6 @@ class TransposedConv(nn.Module):
         x = self.conv(x)  # [B, C, T//stride]
         x = x.transpose(1, 2)
         return x
-
-
-class Decoder(nn.Module):
-    def __init__(self, num_vocab, embed_dim, hidden_dim, layer_num, dropout=0.):
-        super().__init__()
-        self.embedding = nn.Embedding(num_vocab, embed_dim)
-        self.predictor = nn.LSTM(embed_dim, hidden_dim, bidirectional=False, batch_first=True, num_layers=layer_num,
-                                 dropout=dropout)
-
-    def forward(self, y, y_lengths):
-        emb = self.embedding(y)
-        y_lengths = y_lengths.cpu()
-        packed_seq = nn.utils.rnn.pack_padded_sequence(emb, y_lengths, batch_first=True, enforce_sorted=False)
-        packed_seq, _ = self.predictor(packed_seq)
-        out, _ = nn.utils.rnn.pad_packed_sequence(packed_seq, batch_first=True)
-        return out
-
-    def infer(self, y, hidden=None):
-        emb = self.embedding(y)
-        out, hidden = self.predictor(emb, hidden)
-        return out, hidden
 
 
 class SimpleJoiner(nn.Module):
@@ -92,7 +72,16 @@ class ConformerHybrid(nn.Module):
                                             nn.Linear(2 * encoder_d_model, num_vocab))
 
         # RNNT part
-        self.rnnt_decoder = Decoder(num_vocab, predictor_d_model, predictor_d_model, predictor_layer_num, dropout=dropout)
+        self.rnnt_decoder = TransformerDecoder(
+            num_vocab,
+            predictor_d_model,
+            predictor_d_model,
+            predictor_layer_num,
+            dropout,
+            num_heads=8,
+            num_groups=8,
+            context_size=32,
+        )
         self.rnnt_classifier = SimpleJoiner(encoder_d_model, predictor_d_model, joiner_d_model, num_vocab, bias=True,
                                             dropout=dropout)
 
