@@ -96,7 +96,7 @@ class ConformerHybrid(nn.Module):
 
         # RNNT head
         dec_out = self.rnnt_decoder(targets, targets_len)
-        rnnt_logits = self.rnnt_classifier(self.dropout(enc_out), self.dropout(dec_out))
+        rnnt_logits = self.rnnt_classifier(enc_out, dec_out)
 
         return ctc_logits, rnnt_logits, corrected_len
 
@@ -138,7 +138,7 @@ class ConformerHybrid(nn.Module):
         enc_out, _ = self.run_encoder(x, audio_len)
 
         # RNNT greedy decoding
-        dec_out, hidden = self._run_decoder(torch.tensor(blank_token_id))
+        dec_out, hidden = self._run_decoder(torch.tensor(blank_token_id, device=x.device))
         ans = []
         max_gen_tokens = 10  # Redundant in most cases
         for t in range(enc_out.shape[1]):
@@ -161,8 +161,6 @@ class ConformerHybrid(nn.Module):
     def _run_decoder(self, token, hidden=None):
         token = token.unsqueeze(0).unsqueeze(0)
         dec_out, hidden = self.rnnt_decoder.infer(token, hidden)
-        dec_out = self.post_rnnt_dec_norm(dec_out)
-
         return dec_out, hidden
 
     def _run_joiner(self, enc_out, dec_out):
