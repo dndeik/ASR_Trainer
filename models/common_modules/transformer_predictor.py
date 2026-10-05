@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from .transformer_modules import GQASelfAttentionRelPos, SimpleFFN
+from .transformer_modules import OptimGQASelfAttentionRelPos, SimpleFFN
 
 
 class TransformerBlock(nn.Module):
@@ -11,7 +11,7 @@ class TransformerBlock(nn.Module):
         super().__init__()
 
         self.pre_attn_norm = nn.LayerNorm(hidden_dim)
-        self.attn = GQASelfAttentionRelPos(
+        self.attn = OptimGQASelfAttentionRelPos(
             embed_dim=hidden_dim,
             num_heads=num_heads,
             num_groups=num_groups,

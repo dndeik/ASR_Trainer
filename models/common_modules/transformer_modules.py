@@ -134,6 +134,72 @@ class GQASelfAttentionRelPos(nn.Module):
         return rel_pos_emb
 
 
+class OptimGQASelfAttentionRelPos(nn.Module):
+    """GQA attention with a packed query/key/value projection."""
+
+    def __init__(self, embed_dim, num_heads, num_groups, max_position=128, bias=False, dropout=0.0):
+        super().__init__()
+        assert embed_dim % num_heads == 0
+        assert embed_dim % num_groups == 0
+        assert num_heads % num_groups == 0
+
+        self.embed_dim = embed_dim
+        self.num_query_heads = num_heads
+        self.num_kv_heads = num_groups
+        self.head_dim = embed_dim // num_heads
+        self.kv_repeat_factor = num_heads // num_groups
+        self.kv_dim = self.head_dim * num_groups
+        self.max_position = max_position
+
+        self.qkv_proj = nn.Linear(embed_dim, embed_dim + 2 * self.kv_dim, bias=bias)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
+        self.rel_pos_emb = nn.Embedding(2 * max_position - 1, self.head_dim)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, attn_mask=None):
+        batch_size, seq_len, _ = x.shape
+        q, k, v = self.qkv_proj(x).split(
+            (self.embed_dim, self.kv_dim, self.kv_dim), dim=-1
+        )
+        q = q.reshape(batch_size, seq_len, self.num_query_heads, self.head_dim)
+        k = k.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
+        q = q.reshape(
+            batch_size, seq_len, self.num_kv_heads, self.kv_repeat_factor, self.head_dim
+        ).permute(0, 2, 3, 1, 4)
+        q_scaled = q * math.sqrt(1.0 / self.head_dim)
+        k_t = k.permute(0, 2, 3, 1)
+        values = v.permute(0, 2, 1, 3)
+        weights = torch.matmul(q_scaled, k_t.unsqueeze(2))
+
+        positions = torch.arange(seq_len, device=x.device)
+        distance = positions[:, None] - positions[None, :]
+        distance = distance.clamp(-self.max_position + 1, self.max_position - 1)
+        relative = self.rel_pos_emb(distance + self.max_position - 1)
+        weights = weights + torch.einsum("bgrtd,tsd->bgrts", q_scaled, relative)
+
+        if attn_mask is not None:
+            if attn_mask.ndim == 2:
+                mask = attn_mask[None, None, None, :, :]
+            else:
+                mask = attn_mask.reshape(
+                    batch_size,
+                    self.num_kv_heads,
+                    self.kv_repeat_factor,
+                    seq_len,
+                    seq_len,
+                )
+            weights = weights.masked_fill(mask, float("-inf"))
+
+        weights = self.dropout(F.softmax(weights, dim=-1))
+        output = torch.matmul(weights, values.unsqueeze(2))
+        output = output.permute(0, 3, 1, 2, 4).reshape(
+            batch_size, seq_len, self.embed_dim
+        )
+        return self.out_proj(output)
+
+
 class SimpleFFN(nn.Module):
     def __init__(self, d_model, factor=4) -> None:
         super().__init__()

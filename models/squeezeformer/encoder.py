@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import math
 
 from models.common_modules.regularization import DropPath
-from models.common_modules.transformer_modules import SwiGLUFFN, GQASelfAttentionRelPos
+from models.common_modules.transformer_modules import SwiGLUFFN, OptimGQASelfAttentionRelPos
 from models.squeezeformer.conv_module import ConvModule, CausalConv1d
 from models.common_modules.mamba import Mamba2, Mamba2Config
 from utils.masking import get_mask_vector, cut_masks_with_len_vector, fix_full_masked_lines
@@ -39,8 +39,8 @@ class BaseEncoderBlock(nn.Module):
             (self.chunk_size + self.left_context + self.right_context) / self.chunk_size) * self.chunk_size
 
         if self.type == 'attn':
-            self.block = GQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_groups,
-                                                max_position=max_rel_pos, bias=False, dropout=dropout)
+            self.block = OptimGQASelfAttentionRelPos(d_model, num_heads=n_heads, num_groups=n_groups,
+                                                     max_position=max_rel_pos, bias=False, dropout=dropout)
         elif self.type == 'mamba':
             self.block = Mamba2(Mamba2Config(d_model=d_model, chunk_size=chunk_size, expand=1))
         self.attn_norm = nn.LayerNorm(d_model, eps=GLOBAL_EPS)
