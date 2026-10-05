@@ -73,19 +73,19 @@ class BaseEncoderBlock(nn.Module):
             pad_len = (x.shape[1] + self.chunk_size - 1) // self.chunk_size * self.chunk_size - x.shape[1]
             padded_x = torch.cat((x, torch.zeros((B, pad_len, D), device=x.device, dtype=x.dtype)), dim=1)
             x = self.block(padded_x)[0][:, :L, :]
-        x = residual + self.drop_path(self.attn_coef * self.dropout(x))
+        x = residual + self.drop_path(torch.sigmoid(self.attn_coef) * self.dropout(x))
 
         residual = x
         x = self.first_ffn_norm(x)
-        x = residual + self.drop_path(self.first_ffn_coef * self.dropout(self.first_ffn(x)))
+        x = residual + self.drop_path(torch.sigmoid(self.first_ffn_coef) * self.dropout(self.first_ffn(x)))
 
         residual = x
         x = self.conv_norm(x)
-        x = residual + self.drop_path(self.conv_coef * self.dropout(self.conv_block(x)))
+        x = residual + self.drop_path(torch.sigmoid(self.conv_coef) * self.dropout(self.conv_block(x)))
 
         residual = x
         x = self.sec_ffn_norm(x)
-        x = residual + self.drop_path(self.sec_ffn_coef * self.dropout(self.sec_ffn(x)))
+        x = residual + self.drop_path(torch.sigmoid(self.sec_ffn_coef) * self.dropout(self.sec_ffn(x)))
 
         return x
 
@@ -173,7 +173,7 @@ class AudioEncoder(nn.Module):
         x = F.interpolate(x, size=src_len, mode="nearest")
         x = x.transpose(1, 2)
 
-        x = residual + self.drop_path(self.dropout(x))
+        x = residual + self.dropout(x)
 
         for module in self.end_full_blocks:
             x = module(x, full_blocks_masks)
