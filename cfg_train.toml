@@ -42,8 +42,12 @@ min_len = 3
 [train_dataloader]
 batch_size = 10
 num_workers = 6
+prefetch_factor = 1
 drop_last = true
 pin_memory = true
+max_seconds = 220
+bucket_size = 8000
+# max_tokens = 200
 
 [validation_dataset]
 train_manifest = "/opt/datasets/ASR_data/CAPITALIZED_TEST_FINAL.jsonl" # Put the path to your test dataset

@@ -96,7 +96,8 @@ class ConformerHybrid(nn.Module):
 
         # RNNT head
         dec_out = self.rnnt_decoder(targets, targets_len)
-        rnnt_logits = self.rnnt_classifier(enc_out, dec_out)
+        with torch.amp.autocast(enc_out.device.type, enabled=False):
+            rnnt_logits = self.rnnt_classifier(enc_out.float(), dec_out.float())
 
         return ctc_logits, rnnt_logits, corrected_len
 

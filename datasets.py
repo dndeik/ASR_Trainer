@@ -80,6 +80,9 @@ class MyDataset(data.Dataset):
     def get_audio_lens(self):
         return self.final_df["duration"].to_list()
 
+    def get_text_lens(self):
+        return (self.final_df["text"].astype(str).str.len() // 4 + 1).tolist()
+
     def add_augmentations(self, audio, sample_rate=16000, add_gauss=False):
         augmentations = []
         np.random.seed(int(time.time()))
@@ -380,3 +383,105 @@ class BucketingSampler(data.Sampler):
             (len(bucket) + self.batch_size - 1) // self.batch_size
             for bucket in self.buckets
         )
+
+
+class DynamicBucketingSampler(data.Sampler):
+    """Build batches under an audio-seconds budget, grouping similar text lengths."""
+
+    def __init__(self, lengths, token_lengths=None, max_seconds=220, bucket_size=8000,
+                 shuffle=True, drop_last=False, min_batch_size=1, seed=42,
+                 token_band=32, max_tokens=None, vocab_size=None,
+                 frames_per_sec=13.3333, max_grid=1_800_000_000):
+        super().__init__()
+        self.lengths = np.asarray(lengths, dtype=np.float32)
+        self.token_lengths = (
+            np.asarray(token_lengths, dtype=np.int32) if token_lengths is not None else None
+        )
+        if self.token_lengths is not None and len(self.token_lengths) != len(self.lengths):
+            raise ValueError("token_lengths must have the same length as lengths")
+
+        self.max_seconds = max_seconds
+        self.bucket_size = bucket_size
+        self.shuffle = shuffle
+        self.drop_last = drop_last
+        self.min_batch_size = min_batch_size
+        self.seed = seed
+        self.epoch = 0
+        self._n_batches = None
+        self.token_band = token_band
+        self.max_tokens = max_tokens
+        self.grid_v = vocab_size + 1 if vocab_size is not None else None
+        self.frames_per_sec = float(frames_per_sec)
+        self.max_grid = float(max_grid)
+
+        if self.token_lengths is None:
+            self.sorted_indices = np.argsort(self.lengths).tolist()
+        else:
+            duration_band = (self.lengths // 2.0).astype(np.int64)
+            text_band = (self.token_lengths // token_band).astype(np.int64)
+            self.sorted_indices = np.lexsort((self.lengths, text_band, duration_band)).tolist()
+        self.buckets = [
+            self.sorted_indices[i:i + bucket_size]
+            for i in range(0, len(self.sorted_indices), bucket_size)
+        ]
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def __iter__(self):
+        rng = np.random.RandomState(self.seed + self.epoch)
+        batches = []
+        for source_bucket in self.buckets:
+            bucket = source_bucket.copy()
+            if self.shuffle:
+                rng.shuffle(bucket)
+            batch = []
+            max_audio = 0.0
+            max_text = 0
+            for idx in bucket:
+                duration = float(self.lengths[idx])
+                text_len = int(self.token_lengths[idx]) if self.token_lengths is not None else 0
+                projected_size = max(max_audio, duration) * (len(batch) + 1)
+                should_close = (
+                    projected_size > self.max_seconds
+                    and len(batch) >= self.min_batch_size
+                )
+                if not should_close and self.max_tokens is not None:
+                    should_close = (
+                        max(max_text, text_len) * (len(batch) + 1) > self.max_tokens
+                        and len(batch) >= self.min_batch_size
+                    )
+                if not should_close and self.grid_v is not None:
+                    grid_size = (
+                        (len(batch) + 1)
+                        * (max(max_audio, duration) * self.frames_per_sec + 2)
+                        * (max(max_text, text_len) + 1)
+                        * self.grid_v
+                    )
+                    should_close = (
+                        grid_size > self.max_grid
+                        and len(batch) >= self.min_batch_size
+                    )
+                if should_close:
+                    batches.append(batch)
+                    batch = []
+                    max_audio = 0.0
+                    max_text = 0
+                batch.append(idx)
+                max_audio = max(max_audio, duration)
+                max_text = max(max_text, text_len)
+            if batch and (not self.drop_last or len(batch) >= self.min_batch_size):
+                batches.append(batch)
+
+        if self.shuffle:
+            rng.shuffle(batches)
+        self._n_batches = len(batches)
+        yield from batches
+
+    def __len__(self):
+        if self._n_batches is not None:
+            return self._n_batches
+        estimate = float(self.lengths.sum()) / max(self.max_seconds * 0.85, 1.0)
+        if self.token_lengths is not None and self.max_tokens is not None:
+            estimate = min(estimate, float(self.token_lengths.sum()) / max(self.max_tokens * 0.85, 1.0))
+        return max(1, int(estimate))

@@ -1,4 +1,5 @@
 import os
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import json
 import toml
 import torch
@@ -10,7 +11,7 @@ import sentencepiece as spm
 
 from trainer import Trainer
 from models.squeezeformer.model import ConformerHybrid, count_parameters
-from datasets import MyDataset, BucketingSampler
+from datasets import MyDataset, DynamicBucketingSampler
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -46,17 +47,25 @@ def run(rank, config, args):
                               **config['train_dataset'], is_train=True,
                               lang_switch_enable=config["augmentations"]["lang_switch_enable"])
     train_dataset.set_augmentations(**config["augmentations"])
-    train_sampler = BucketingSampler(
-        train_dataset.get_audio_lens(),
-        config["train_dataloader"]["batch_size"],
-        bucket_size=600,
-        drop_last=True
+    sampler_config = config["train_dataloader"]
+    train_sampler = DynamicBucketingSampler(
+        lengths=train_dataset.get_audio_lens(),
+        token_lengths=train_dataset.get_text_lens(),
+        max_seconds=sampler_config.get("max_seconds", 220),
+        bucket_size=sampler_config.get("bucket_size", 8000),
+        shuffle=True,
+        drop_last=sampler_config.get("drop_last", True),
+        max_tokens=sampler_config.get("max_tokens"),
+        vocab_size=tokenizer.vocab_size(),
+        frames_per_sec=(config["listener"]["listener_sr"]
+                        / (config["FFT"]["hop_length"] * config["model"]["time_factor"])),
     )
     train_dataloader = torch.utils.data.DataLoader(
         dataset=train_dataset,
         batch_sampler=train_sampler,
         pin_memory=config['train_dataloader']['pin_memory'],
         num_workers=config['train_dataloader']['num_workers'],
+        prefetch_factor=sampler_config.get("prefetch_factor", 1),
         shuffle=False,
         collate_fn=train_dataset.custom_collate_fn,
         worker_init_fn=worker_init_fn
