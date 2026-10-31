@@ -2,6 +2,7 @@ import os
 import time
 import random
 import math
+import json
 import torch
 import pandas as pd
 import numpy as np
@@ -68,10 +69,21 @@ class MyDataset(data.Dataset):
 
     @staticmethod
     def get_files_from_manifest(manifest):
-        df = pd.read_json(manifest, lines=True)
-        df = df[["audio_filepath", "text", "duration", "lang"]]
+        paths, texts, durations, languages = [], [], [], []
+        with open(manifest, "r", encoding="utf-8") as source:
+            for line in source:
+                row = json.loads(line)
+                paths.append(row["audio_filepath"])
+                texts.append(row["text"])
+                durations.append(row["duration"])
+                languages.append(row["lang"])
 
-        return df
+        return pd.DataFrame({
+            "audio_filepath": paths,
+            "text": texts,
+            "duration": np.asarray(durations, dtype=np.float32),
+            "lang": languages,
+        })
 
     def explicit_shuffle(self):
         print("Shuffle dataset")
