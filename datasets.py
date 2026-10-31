@@ -323,10 +323,11 @@ class MyDataset(data.Dataset):
             ids_len.append(ids.shape[-1])
             padded_ids.append(padded_item)
 
-        return torch.stack(padded_audio), torch.tensor(audio_len), torch.stack(padded_ids), torch.tensor(ids_len)
+        return (torch.stack(padded_audio), torch.tensor(audio_len, dtype=torch.int32),
+                torch.stack(padded_ids), torch.tensor(ids_len, dtype=torch.int32))
 
     def get_another_lang_sample(self, cur_lang, cur_len):
-        max_additional_len = self.max_len - cur_len
+        max_additional_len = min(0.3 * cur_len, self.max_len - cur_len)
 
         if max_additional_len <= 1.0:
             return None, [], None
