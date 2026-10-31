@@ -66,6 +66,7 @@ class Trainer:
 
         # training config
         self.trainer_config = config['trainer']
+        self.rnnt_chunk_grid_gb = self.trainer_config.get('rnnt_chunk_grid_gb', 4.0)
         self.epochs = self.trainer_config['epochs']
         self.save_checkpoint_interval = self.trainer_config['save_checkpoint_interval']
         self.save_n_last_checkpoints = self.trainer_config.get('save_n_last_checkpoints', -1)
@@ -292,6 +293,105 @@ class Trainer:
             'logit_norm_loss': logit_norm_loss,
         }
 
+    def _chunked_rnnt_loss(self, enc_out, targets, target_lengths, x_lengths):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        batch_size = enc_out.shape[0]
+        targets = targets.to(torch.int32)
+        vocab_size = model.rnnt_classifier.fc_out.out_features
+        max_time = int(x_lengths.max())
+        max_target = int(target_lengths.max()) + 1
+        chunk_size = max(
+            1,
+            int(self.rnnt_chunk_grid_gb * (2 ** 30))
+            // (4 * max_time * max_target * vocab_size),
+        )
+
+        predictor_targets = torch.cat(
+            [torch.full((batch_size, 1), self.blank_token_id, device=targets.device), targets],
+            dim=1,
+        )
+        predictor_lengths = target_lengths + 1
+        chunk_loss_sum = torch.zeros((), device=targets.device)
+        penalty_square_sum = torch.zeros((), device=targets.device)
+        penalty_element_count = 0
+
+        for start in range(0, batch_size, chunk_size):
+            end = min(start + chunk_size, batch_size)
+            chunk_x_lengths = x_lengths[start:end]
+            chunk_target_lengths = target_lengths[start:end]
+            chunk_time = int(chunk_x_lengths.max())
+            chunk_target = int(chunk_target_lengths.max())
+
+            if self.use_amp:
+                with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                    decoder_out = model.rnnt_decoder(
+                        predictor_targets[start:end], predictor_lengths[start:end]
+                    )
+            else:
+                decoder_out = model.rnnt_decoder(
+                    predictor_targets[start:end], predictor_lengths[start:end]
+                )
+
+            with torch.amp.autocast(device_type=self.device.type, enabled=False):
+                rnnt_logits = model.rnnt_classifier(
+                    enc_out[start:end].float(), decoder_out.float()
+                )
+
+            chunk_loss_sum = chunk_loss_sum + self.rnnt_loss(
+                rnnt_logits[:, :chunk_time, :chunk_target + 1].contiguous(),
+                targets[start:end, :chunk_target].contiguous(),
+                chunk_x_lengths.to(torch.int32),
+                chunk_target_lengths.to(torch.int32),
+                blank=self.blank_token_id,
+                reduction="sum",
+            )
+            if self.logit_norm_penalty:
+                penalty_square_sum = penalty_square_sum + rnnt_logits.square().sum()
+                penalty_element_count += rnnt_logits.numel()
+
+        rnnt_loss = chunk_loss_sum / batch_size
+        if self.logit_norm_penalty:
+            penalty = penalty_square_sum / max(penalty_element_count, 1) * 1e-4
+        else:
+            penalty = torch.zeros((), device=targets.device)
+        return rnnt_loss, penalty
+
+    def _compute_loss_chunked(self, features, audio_len, targets, target_lengths):
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if self.use_amp:
+            with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                enc_out, corrected_lengths = model.run_encoder(features, audio_len)
+                ctc_logits = model.run_ctc_head(enc_out)
+        else:
+            enc_out, corrected_lengths = model.run_encoder(features, audio_len)
+            ctc_logits = model.run_ctc_head(enc_out)
+
+        corrected_lengths = corrected_lengths.long()
+        ctc_out = ctc_logits.transpose(0, 1)
+        ctc_logits_f = ctc_out.float()
+        if ctc_logits_f.shape[0] > corrected_lengths.max():
+            ctc_logits_f = ctc_logits_f[:corrected_lengths.max(), ...]
+        loss_ctc = self.ctc_loss(
+            torch.log_softmax(ctc_logits_f, dim=-1),
+            targets.to(torch.int32),
+            corrected_lengths.to(torch.int32),
+            target_lengths.to(torch.int32),
+        )
+        loss_rnnt, logit_norm_loss = self._chunked_rnnt_loss(
+            enc_out, targets, target_lengths, corrected_lengths
+        )
+        total_loss = (
+            self.ctc_weight * loss_ctc
+            + self.rnnt_weight * loss_rnnt
+            + logit_norm_loss
+        )
+        return {
+            'total_loss': total_loss,
+            'ctc_loss': loss_ctc,
+            'rnnt_loss': loss_rnnt,
+            'logit_norm_loss': logit_norm_loss,
+        }, ctc_out, None
+
     @staticmethod
     def _compute_joiner_penalties(
             rnnt_logits,
@@ -428,14 +528,9 @@ class Trainer:
                 target = target.to(self.device).long()
                 target_len = target_len.to(self.device).long()
 
-                if self.use_amp:
-                    with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                        ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target,
-                                                                                    target_len)
-                        loss_dict = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
-                else:
-                    ctc_out, rnnt_out, corrected_audio_len = self._model_invoke(features, audio_len, target, target_len)
-                    loss_dict = self._calculate_loss(ctc_out, rnnt_out, target, corrected_audio_len, target_len)
+                loss_dict, ctc_out, rnnt_out = self._compute_loss_chunked(
+                    features, audio_len, target, target_len
+                )
 
                 loss = loss_dict['total_loss']
 

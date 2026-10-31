@@ -79,6 +79,8 @@ strict = true
 [trainer]
 ctc_weight = 0.4
 logit_norm_penalty = false
+# Maximum temporary RNNT joiner grid size per chunk, in GiB.
+rnnt_chunk_grid_gb = 4
 epochs = 30
 warm_up_steps = 2500
 epoch_when_enable_aug = 0
