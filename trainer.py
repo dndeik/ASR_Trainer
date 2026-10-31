@@ -134,9 +134,13 @@ class Trainer:
 
     def _set_train_mode(self):
         self.model.train()
+        if hasattr(self.optimizer, "train"):
+            self.optimizer.train()
 
     def _set_eval_mode(self):
         self.model.eval()
+        if hasattr(self.optimizer, "eval"):
+            self.optimizer.eval()
 
     def _save_checkpoint(self, step: int, score: Optional[float]):
         model_dict = self.model.module.state_dict() if self.world_size > 1 else self.model.state_dict()
@@ -147,7 +151,7 @@ class Trainer:
             'epoch': epoch,
             'best_score': self.best_score,
             'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict(),
+            'scheduler': self.scheduler.state_dict() if self.scheduler is not None else None,
             'model': model_dict
         }
 
@@ -190,8 +194,15 @@ class Trainer:
 
         self.global_step = checkpoint['step'] + 1
         self.start_epoch = (self.global_step * self.accum_step) // len(self.train_dataloader)
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.scheduler.load_state_dict(checkpoint['scheduler'])
+        try:
+            self.optimizer.load_state_dict(checkpoint['optimizer'])
+        except (RuntimeError, ValueError) as exc:
+            print(f"WARNING: optimizer state not restored ({exc}); using fresh state.")
+        if self.scheduler is not None and checkpoint.get('scheduler') is not None:
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler'])
+            except (RuntimeError, ValueError) as exc:
+                print(f"WARNING: scheduler state not restored ({exc}); using fresh state.")
         self.best_score = checkpoint.get('best_score', float('inf'))
 
         if self.world_size > 1:
@@ -564,7 +575,10 @@ class Trainer:
                     train_bar.write("")
                     train_bar.write(f"REF: {target_text[0]}")
                     train_bar.write(f"EST: {esti_text[0]}")
-                    self.writer.add_scalars('LR', {'lr': self.optimizer.param_groups[0]['lr']},
+                    lr = self.optimizer.param_groups[0].get(
+                        'scheduled_lr', self.optimizer.param_groups[0]['lr']
+                    )
+                    self.writer.add_scalars('LR', {'lr': lr},
                                             self.global_step)
                     log_dict = {k: accum_losses.get(k, 0) / log_step for k in accum_losses}
                     self.writer.add_scalars('Monitoring', log_dict, self.global_step)
@@ -612,7 +626,8 @@ class Trainer:
 
             self.optimizer.step()
             self.optimizer.zero_grad()
-            self.scheduler.step()
+            if self.scheduler is not None:
+                self.scheduler.step()
             self.global_step += 1
             self.writer.add_scalars('Grad norm', {'grad_norm': cur_gn}, self.global_step)
 

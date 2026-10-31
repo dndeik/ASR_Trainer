@@ -113,16 +113,68 @@ def run(rank, config, args):
     if args.world_size > 1:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank])
 
-    optimizer = torch.optim.AdamW(params=model.parameters(), lr=config['optimizer']['lr'], weight_decay=0.01,
-                                  betas=(0.9, 0.998))
+    encoder_params, predictor_params, head_params = [], [], []
+    for name, parameter in model.named_parameters():
+        if 'rnnt_classifier' in name or 'ctc_classifier' in name:
+            head_params.append(parameter)
+        elif 'rnnt_decoder' in name:
+            predictor_params.append(parameter)
+        else:
+            encoder_params.append(parameter)
 
-    t0 = config["trainer"]["warm_up_steps"] / int(
-        len(train_dataloader) * config["trainer"]["epochs"] // config["trainer"]["grad_accum"])
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=[1e-4],
-                                                    div_factor=200, pct_start=t0, anneal_strategy='cos',
-                                                    steps_per_epoch=len(train_dataloader) // config["trainer"][
-                                                        "grad_accum"],
-                                                    epochs=config["trainer"]["epochs"])
+    optimizer_config = config.get("optimizer", {})
+    parameter_groups = [
+        {
+            "params": encoder_params,
+            "lr": optimizer_config.get("lr_encoder", 5e-4),
+            "weight_decay": optimizer_config.get("weight_decay", 1e-3),
+            "name": "encoder",
+        },
+        {
+            "params": predictor_params,
+            "lr": optimizer_config.get("lr_predictor", 6e-4),
+            "weight_decay": optimizer_config.get("weight_decay", 1e-3),
+            "name": "predictor",
+        },
+        {
+            "params": head_params,
+            "lr": optimizer_config.get("lr_heads", 6e-4),
+            "weight_decay": optimizer_config.get("weight_decay", 1e-3),
+            "name": "heads",
+        },
+    ]
+
+    if optimizer_config.get("schedule_free", True):
+        from schedulefree import AdamWScheduleFree
+        optimizer = AdamWScheduleFree(
+            parameter_groups,
+            betas=tuple(optimizer_config.get("betas", [0.9, 0.999])),
+            r=optimizer_config.get("r", 1.0),
+            warmup_steps=config["trainer"].get("warm_up_steps", 0),
+        )
+        optimizer.train()
+        scheduler = None
+    else:
+        optimizer = torch.optim.AdamW(
+            parameter_groups,
+            betas=tuple(optimizer_config.get("betas", [0.9, 0.999])),
+        )
+        steps_per_epoch = max(
+            1,
+            len(train_dataloader) // config["trainer"]["grad_accum"],
+        )
+        total_steps = steps_per_epoch * config["trainer"]["epochs"]
+        warmup_steps = config["trainer"].get("warm_up_steps", 0)
+        pct_start = min(warmup_steps / max(total_steps, 1), 0.99)
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=[group["lr"] for group in parameter_groups],
+            div_factor=optimizer_config.get("onecycle_div", 150),
+            pct_start=pct_start,
+            anneal_strategy="cos",
+            steps_per_epoch=steps_per_epoch,
+            epochs=config["trainer"]["epochs"],
+        )
 
     trainer = Trainer(config=config, model=model, tokenizer=tokenizer, blank_token_id=blank_token_id,
                       optimizer=optimizer, scheduler=scheduler,

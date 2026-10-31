@@ -6,6 +6,12 @@ devices = "0"   # number of available gpus
 
 [optimizer]
 lr = 3.5e-5
+schedule_free = true
+lr_encoder = 5e-4
+lr_predictor = 6e-4
+lr_heads = 6e-4
+weight_decay = 0.001
+onecycle_div = 150
 
 [model]
 encoder_d_model = 640
