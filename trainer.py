@@ -55,7 +55,10 @@ class Trainer:
 
         self.ctc_loss = torch.nn.modules.CTCLoss(blank=self.blank_token_id, zero_infinity=True).to(self.device)
         self.rnnt_loss = torchaudio.functional.rnnt_loss
-        self.ctc_weight = 0.3
+        trainer_config = config["trainer"]
+        self.ctc_weight = trainer_config.get("ctc_weight", 0.4)
+        self.rnnt_weight = 1 - self.ctc_weight
+        self.logit_norm_penalty = trainer_config.get("logit_norm_penalty", True)
 
         self.train_sampler = train_sampler
         self.train_dataloader = train_dataloader
@@ -242,9 +245,6 @@ class Trainer:
         x_lengths = x_lengths.to(torch.int32)
         target_lengths = target_lengths.to(torch.int32)
 
-        ctc_weight = 0.75
-        rnnt_weight = 1
-
         if ctc_logits.shape[0] > x_lengths.max():
             print("WARNING: logits more then x_lengths max")
             ctc_logits = ctc_logits[:x_lengths.max(), ...]
@@ -278,16 +278,18 @@ class Trainer:
                 ))
             loss_rnnt = torch.stack(chunk_losses).sum() / batch_size
 
-        lambda_logit_weight = 1e-4
-        logit_norm_penalty = rnnt_logits.pow(2).mean() * lambda_logit_weight
+        if self.logit_norm_penalty:
+            logit_norm_loss = rnnt_logits.pow(2).mean() * 1e-4
+        else:
+            logit_norm_loss = torch.zeros((), device=rnnt_logits.device)
 
-        loss = ctc_weight * loss_ctc + rnnt_weight * loss_rnnt + logit_norm_penalty
+        loss = self.ctc_weight * loss_ctc + self.rnnt_weight * loss_rnnt + logit_norm_loss
 
         return {
             'total_loss': loss,
             'ctc_loss': loss_ctc,
             'rnnt_loss': loss_rnnt,
-            'logit_norm_loss': logit_norm_penalty,
+            'logit_norm_loss': logit_norm_loss,
         }
 
     @staticmethod

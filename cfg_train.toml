@@ -77,6 +77,8 @@ checkpoint_path = "experiments/RU_18_layer_model_GQA_Squeezeformer_|_New_tokeniz
 strict = true
 
 [trainer]
+ctc_weight = 0.4
+logit_norm_penalty = false
 epochs = 30
 warm_up_steps = 2500
 epoch_when_enable_aug = 0
