@@ -252,8 +252,31 @@ class Trainer:
         ctc_log_probs = torch.nn.functional.log_softmax(ctc_logits, dim=-1)
         loss_ctc = self.ctc_loss(ctc_log_probs, targets, x_lengths, target_lengths)
 
-        # RNNT loss принимает сырые логиты
-        loss_rnnt = self.rnnt_loss(rnnt_logits, targets, x_lengths, target_lengths, blank=self.blank_token_id)
+        # torchaudio's CUDA kernel can overflow int32 indexing on very large grids.
+        batch_size, time_size, target_size, vocab_size = rnnt_logits.shape
+        grid_size = batch_size * time_size * target_size * vocab_size
+        if grid_size < 2_000_000_000:
+            loss_rnnt = self.rnnt_loss(
+                rnnt_logits, targets, x_lengths, target_lengths, blank=self.blank_token_id
+            )
+        else:
+            max_batch = max(1, 2_000_000_000 // (time_size * target_size * vocab_size))
+            chunk_losses = []
+            for start in range(0, batch_size, max_batch):
+                end = min(start + max_batch, batch_size)
+                chunk_x_lengths = x_lengths[start:end]
+                chunk_target_lengths = target_lengths[start:end]
+                chunk_time = int(chunk_x_lengths.max())
+                chunk_target = int(chunk_target_lengths.max())
+                chunk_losses.append(self.rnnt_loss(
+                    rnnt_logits[start:end, :chunk_time, :chunk_target + 1].contiguous(),
+                    targets[start:end, :chunk_target].contiguous(),
+                    chunk_x_lengths,
+                    chunk_target_lengths,
+                    blank=self.blank_token_id,
+                    reduction="sum",
+                ))
+            loss_rnnt = torch.stack(chunk_losses).sum() / batch_size
 
         lambda_logit_weight = 1e-4
         logit_norm_penalty = rnnt_logits.pow(2).mean() * lambda_logit_weight
