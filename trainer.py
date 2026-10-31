@@ -251,7 +251,6 @@ class Trainer:
 
     def _calculate_loss(self, ctc_logits, rnnt_logits, targets, x_lengths, target_lengths):
         ctc_logits = ctc_logits.float()
-        rnnt_logits = rnnt_logits.float()
 
         targets = targets.to(torch.int32)
         x_lengths = x_lengths.to(torch.int32)
@@ -451,12 +450,12 @@ class Trainer:
         total_rnnt_wer = 0
         validation_bar = tqdm(self.validation_dataloader, ncols=160)
         for step, (audio, audio_len, target, target_len) in enumerate(validation_bar, 1):
-            audio = audio.to(self.device)
-            audio_len = audio_len.to(self.device).long()
+            audio = audio.to(self.device, non_blocking=True)
+            audio_len = audio_len.to(self.device, non_blocking=True).long()
             features, audio_len = self.feature_extractor(audio, audio_len)
 
-            target = target.to(self.device).long()
-            target_len = target_len.to(self.device).long()
+            target = target.to(self.device, non_blocking=True).long()
+            target_len = target_len.to(self.device, non_blocking=True).long()
 
             if self.use_amp:
                 with torch.amp.autocast(device_type=self.device.type, dtype=self.amp_dtype):
@@ -512,6 +511,7 @@ class Trainer:
         accum_wer = 0
 
         steps_from_last_val = 0
+        avg_loss_display = 0.0
 
         for epoch in range(self.start_epoch, self.epochs):
             if epoch >= self.aug_start_epoch:
@@ -530,14 +530,14 @@ class Trainer:
             self.optimizer.zero_grad()
 
             for step, (audio, audio_len, target, target_len) in enumerate(train_bar, 1):
-                audio = audio.to(self.device)
-                audio_len = audio_len.to(self.device).long()
+                audio = audio.to(self.device, non_blocking=True)
+                audio_len = audio_len.to(self.device, non_blocking=True).long()
                 features, audio_len = self.feature_extractor(audio, audio_len)
                 features = self.token_dropout(features)
                 features = self.spec_aug(features)
 
-                target = target.to(self.device).long()
-                target_len = target_len.to(self.device).long()
+                target = target.to(self.device, non_blocking=True).long()
+                target_len = target_len.to(self.device, non_blocking=True).long()
 
                 loss_dict, ctc_out, rnnt_out = self._compute_loss_chunked(
                     features, audio_len, target, target_len
@@ -545,7 +545,7 @@ class Trainer:
 
                 loss = loss_dict['total_loss']
 
-                if torch.isnan(loss) or torch.isinf(loss):
+                if step % self.accum_step == 0 and not torch.isfinite(loss):
                     print("NaN/Inf loss detected, skipping step.")
                     self.optimizer.zero_grad()
                     continue
@@ -568,7 +568,9 @@ class Trainer:
 
                 avg_loss = total_losses.get('total_loss', 0) / max(steps_from_last_val, 1)
                 avg_wer = total_wer / max(steps_from_last_val, 1)
-                train_bar.postfix = f'train_loss={avg_loss:.2f}, wer({wer_type})={avg_wer:.3f}, g_step={self.global_step}'
+                if step % (20 * self.accum_step) == 0:
+                    avg_loss_display = float(avg_loss.detach())
+                train_bar.postfix = f'train_loss={avg_loss_display:.2f}, wer({wer_type})={avg_wer:.3f}, g_step={self.global_step}'
 
                 log_step = self.accum_step
                 if step % log_step == 0 and self.rank == 0:
